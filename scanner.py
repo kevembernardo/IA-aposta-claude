@@ -1,16 +1,15 @@
 """
 Scanner — Busca partidas e odds via Claude API com web search
 =============================================================
-Usa o modelo Claude com busca web para encontrar dados reais
-de partidas e odds, depois roda o motor matemático.
+CORREÇÃO: usa AsyncAnthropic para não bloquear o event loop.
 """
 
 import json
 import logging
 import re
 from datetime import datetime
-from typing import List, Dict, Optional
-from anthropic import Anthropic
+from typing import List, Dict
+from anthropic import AsyncAnthropic
 from engine.math_engine import analyze_match
 
 log = logging.getLogger(__name__)
@@ -72,10 +71,11 @@ Responda em 3 partes curtas (máx 150 palavras total):
 
 class Scanner:
     def __init__(self, api_key: str):
-        self.client = Anthropic(api_key=api_key)
+        # AsyncAnthropic — não bloqueia o event loop
+        self.client = AsyncAnthropic(api_key=api_key)
 
-    def _call_claude(self, prompt: str, use_search: bool = False) -> str:
-        """Chama a API do Claude, com ou sem web search."""
+    async def _call_claude(self, prompt: str, use_search: bool = False) -> str:
+        """Chama a API do Claude de forma assíncrona."""
         kwargs = {
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 2000,
@@ -84,26 +84,36 @@ class Scanner:
         if use_search:
             kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
 
-        response = self.client.messages.create(**kwargs)
-        return "".join(b.text for b in response.content if hasattr(b, "text"))
+        response = await self.client.messages.create(**kwargs)
+        return "".join(
+            b.text for b in response.content if hasattr(b, "text") and b.text
+        )
 
     def _parse_json(self, raw: str) -> dict:
-        """Extrai e parseia JSON da resposta do Claude."""
+        """Extrai e parseia JSON da resposta, tolerante a texto extra."""
         clean = re.sub(r"```json|```", "", raw).strip()
         start = clean.find("{")
         end   = clean.rfind("}") + 1
-        if start == -1 or end == 0:
-            raise ValueError("JSON não encontrado na resposta")
+        if start == -1 or end <= 0:
+            raise ValueError(f"JSON não encontrado. Resposta recebida: {raw[:300]}")
         return json.loads(clean[start:end])
 
-    async def scan(self, leagues: List[str], max_matches: int = 10,
-                   banca: float = 1000, kelly_fraction: float = 0.25) -> List[Dict]:
+    async def scan(
+        self,
+        leagues: List[str],
+        max_matches: int = 10,
+        banca: float = 1000.0,
+        kelly_fraction: float = 0.25,
+    ) -> List[Dict]:
         """
-        Scan completo: busca partidas → analisa → retorna oportunidades ordenadas por EV.
+        Scan completo:
+        1. Busca partidas e odds via web search
+        2. Roda motor matemático (Poisson + Kelly + EV)
+        3. Retorna oportunidades ordenadas por EV
         """
-        log.info(f"Iniciando scan — {len(leagues)} ligas, max {max_matches} partidas")
+        log.info(f"Scan iniciado — {len(leagues)} ligas | banca R${banca:.0f} | kelly {kelly_fraction*100:.0f}%")
 
-        # 1. Buscar dados das partidas
+        # ── ETAPA 1: buscar dados ─────────────────────────────────────────────
         prompt = FETCH_PROMPT.format(
             datetime=datetime.now().strftime("%d/%m/%Y %H:%M"),
             leagues=", ".join(leagues),
@@ -111,32 +121,46 @@ class Scanner:
         )
 
         try:
-            raw = self._call_claude(prompt, use_search=True)
+            raw = await self._call_claude(prompt, use_search=True)
+            log.info(f"Resposta recebida ({len(raw)} chars)")
             data = self._parse_json(raw)
             matches = data.get("matches", [])
-            log.info(f"{len(matches)} partidas encontradas")
+            log.info(f"{len(matches)} partidas encontradas no scan")
+        except json.JSONDecodeError as e:
+            log.error(f"Erro ao parsear JSON: {e}")
+            return []
         except Exception as e:
-            log.error(f"Erro ao buscar partidas: {e}")
+            log.error(f"Erro ao buscar partidas: {e}", exc_info=True)
             return []
 
-        # 2. Rodar motor matemático em cada partida
+        # ── ETAPA 2: motor matemático ─────────────────────────────────────────
         opportunities = []
         for match in matches:
             try:
-                markets = analyze_match(match, banca, kelly_fraction)
-                best    = markets[0] if markets else None
-
-                if not best or best.ev_pct <= 0:
+                # Validar campos mínimos
+                required = ["homeTeam", "awayTeam", "homeAvgGoalsScored",
+                            "homeAvgGoalsConceded", "awayAvgGoalsScored", "awayAvgGoalsConceded"]
+                if not all(match.get(f) for f in required):
+                    log.warning(f"Dados incompletos para {match.get('homeTeam','?')} vs {match.get('awayTeam','?')}")
                     continue
 
-                # Gerar análise qualitativa da IA
-                ai_analysis = self._get_ai_analysis(match, markets[:3])
+                markets = analyze_match(match, banca, kelly_fraction)
+                if not markets:
+                    continue
 
-                opportunity = {
+                best = markets[0]
+                if best.ev_pct <= 0:
+                    log.info(f"  ✗ {match['homeTeam']} vs {match['awayTeam']} — sem EV+ (melhor: {best.ev_pct:.1f}%)")
+                    continue
+
+                # Análise qualitativa (sem web search para economizar tokens)
+                ai_analysis = await self._get_ai_analysis(match, markets[:3])
+
+                opp = {
                     "home_team":    match["homeTeam"],
                     "away_team":    match["awayTeam"],
                     "league":       match["league"],
-                    "date":         match["date"],
+                    "date":         match.get("date", "?"),
                     "context":      match.get("context", ""),
                     "market_key":   best.key,
                     "market_label": best.label,
@@ -150,7 +174,7 @@ class Scanner:
                     "stake":        best.stake,
                     "cls_label":    best.cls_label,
                     "cls_color":    best.cls_color,
-                    "all_markets":  [
+                    "all_markets": [
                         {
                             "label":     m.label,
                             "odds":      m.odds,
@@ -163,19 +187,18 @@ class Scanner:
                     "ai_analysis":  ai_analysis,
                     "scanned_at":   datetime.now().isoformat(),
                 }
-                opportunities.append(opportunity)
-                log.info(f"  ✓ {match['homeTeam']} vs {match['awayTeam']} — {best.label} EV: {best.ev_pct:.1f}%")
+                opportunities.append(opp)
+                log.info(f"  ✓ {match['homeTeam']} vs {match['awayTeam']} — {best.label} | EV {best.ev_pct:.1f}% | Apostar R${best.stake:.2f}")
 
             except Exception as e:
                 log.warning(f"Erro ao processar {match.get('homeTeam','?')} vs {match.get('awayTeam','?')}: {e}")
 
-        # Ordenar por EV
         opportunities.sort(key=lambda x: x["ev_pct"], reverse=True)
         log.info(f"Scan finalizado. {len(opportunities)} oportunidades com EV positivo")
         return opportunities
 
-    def _get_ai_analysis(self, match: dict, top_markets) -> str:
-        """Gera análise qualitativa da IA para o jogo."""
+    async def _get_ai_analysis(self, match: dict, top_markets) -> str:
+        """Análise qualitativa — texto curto para a mensagem do Telegram."""
         try:
             opps_text = "\n".join(
                 f"{i+1}. {m.label}: EV {m.ev_pct:.1f}% | Edge {m.edge_pct:.1f}% | "
@@ -185,12 +208,12 @@ class Scanner:
             prompt = ANALYSIS_PROMPT.format(
                 home=match["homeTeam"],
                 away=match["awayTeam"],
-                league=match["league"],
-                date=match["date"],
+                league=match.get("league", "?"),
+                date=match.get("date", "?"),
                 opportunities=opps_text,
                 context=match.get("context", "N/A"),
             )
-            return self._call_claude(prompt, use_search=False)
+            return await self._call_claude(prompt, use_search=False)
         except Exception as e:
             log.warning(f"Erro na análise qualitativa: {e}")
             return "Análise indisponível."
