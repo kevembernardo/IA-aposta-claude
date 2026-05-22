@@ -1,6 +1,6 @@
 """
 BETTING AI ENGINE — Sistema Autônomo 24/7
-Com modo diagnóstico: envia no Telegram o que encontrou em cada scan.
+Usa Google Gemini (100% gratuito) com Google Search integrado.
 """
 
 import asyncio
@@ -11,8 +11,8 @@ import os
 import re
 import sys
 import urllib.request
-import urllib.parse
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 from typing import List, Dict, Tuple
 
@@ -35,12 +35,15 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# executor para rodar chamadas síncronas do Gemini sem bloquear o loop
+_executor = ThreadPoolExecutor(max_workers=2)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURAÇÃO
 # ═══════════════════════════════════════════════════════════════════════════════
 class Config:
     def __init__(self):
-        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        self.gemini_api_key    = os.getenv("GEMINI_API_KEY", "")
         self.telegram_token    = os.getenv("TELEGRAM_TOKEN", "")
         self.telegram_chat_id  = os.getenv("TELEGRAM_CHAT_ID", "")
         self.banca             = float(os.getenv("BANCA", "1000"))
@@ -49,7 +52,6 @@ class Config:
         self.min_ev_pct        = float(os.getenv("MIN_EV_PCT", "1"))
         self.scan_interval_min = int(os.getenv("SCAN_INTERVAL_MIN", "180"))
         self.max_matches       = int(os.getenv("MAX_MATCHES", "10"))
-        self.summary_hour      = int(os.getenv("SUMMARY_HOUR", "8"))
         self.debug_mode        = os.getenv("DEBUG_MODE", "true").lower() == "true"
         self.leagues           = os.getenv(
             "LEAGUES",
@@ -58,9 +60,9 @@ class Config:
 
     def validate(self):
         errors = []
-        if not self.anthropic_api_key: errors.append("ANTHROPIC_API_KEY não definida")
-        if not self.telegram_token:    errors.append("TELEGRAM_TOKEN não definida")
-        if not self.telegram_chat_id:  errors.append("TELEGRAM_CHAT_ID não definida")
+        if not self.gemini_api_key:   errors.append("GEMINI_API_KEY não definida")
+        if not self.telegram_token:   errors.append("TELEGRAM_TOKEN não definida")
+        if not self.telegram_chat_id: errors.append("TELEGRAM_CHAT_ID não definida")
         if errors:
             raise ValueError("Configuração inválida:\n" + "\n".join(f"  • {e}" for e in errors))
 
@@ -135,7 +137,40 @@ def analyze_match(match: dict, banca: float, kfrac: float) -> List[Dict]:
     return sorted(results, key=lambda x: x["ev_pct"], reverse=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM
+# GEMINI API — 100% GRATUITO
+# ═══════════════════════════════════════════════════════════════════════════════
+def _gemini_call_sync(api_key: str, prompt: str, use_search: bool = False) -> str:
+    """Chamada síncrona ao Gemini — roda em thread separada."""
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+
+    if use_search:
+        # Gemini com Google Search grounding — busca real na web
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        tools = [{"google_search_retrieval": {}}]
+        resp  = model.generate_content(prompt, tools=tools)
+    else:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        resp  = model.generate_content(prompt)
+
+    return resp.text or ""
+
+async def call_gemini(api_key: str, prompt: str, use_search: bool = False) -> str:
+    """Wrapper async — não bloqueia o event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor, _gemini_call_sync, api_key, prompt, use_search
+    )
+
+def parse_json(raw: str) -> dict:
+    clean = re.sub(r"```json|```", "", raw).strip()
+    s, e  = clean.find("{"), clean.rfind("}") + 1
+    if s == -1 or e <= 0:
+        raise ValueError(f"JSON não encontrado. Resposta: {raw[:300]}")
+    return json.loads(clean[s:e])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM — urllib stdlib
 # ═══════════════════════════════════════════════════════════════════════════════
 def tg_send_sync(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
@@ -147,7 +182,7 @@ def tg_send_sync(token: str, chat_id: str, text: str) -> bool:
         "parse_mode": "HTML", "disable_web_page_preview": True,
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload,
-        headers={"Content-Type":"application/json"}, method="POST")
+        headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = json.loads(resp.read().decode())
@@ -155,105 +190,76 @@ def tg_send_sync(token: str, chat_id: str, text: str) -> bool:
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         log.error(f"Telegram HTTP {e.code}: {body}")
-        if e.code == 401: log.error("TELEGRAM_TOKEN inválido!")
-        if "chat not found" in body: log.error("TELEGRAM_CHAT_ID inválido!")
         return False
     except Exception as e:
         log.error(f"Erro Telegram: {e}")
         return False
 
 async def tg_send(token, chat_id, text) -> bool:
-    return await asyncio.get_event_loop().run_in_executor(
-        None, tg_send_sync, token, chat_id, text)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, tg_send_sync, token, chat_id, text)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CLAUDE API
-# ═══════════════════════════════════════════════════════════════════════════════
-async def call_claude(api_key: str, prompt: str, use_search: bool = False) -> str:
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(api_key=api_key)
-    kwargs = {
-        "model": "claude-sonnet-4-5",
-        "max_tokens": 2000,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if use_search:
-        kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
-    resp = await client.messages.create(**kwargs)
-    return "".join(b.text for b in resp.content if hasattr(b, "text") and b.text)
-
-def parse_json(raw: str) -> dict:
-    clean = re.sub(r"```json|```", "", raw).strip()
-    s, e = clean.find("{"), clean.rfind("}") + 1
-    if s == -1 or e <= 0:
-        raise ValueError(f"JSON não encontrado. Resposta: {raw[:300]}")
-    return json.loads(clean[s:e])
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SCANNER COM DIAGNÓSTICO
+# SCANNER
 # ═══════════════════════════════════════════════════════════════════════════════
 FETCH_PROMPT = """Você é um coletor de dados de apostas esportivas.
 Data/hora atual: {dt}
 
-Use web search para encontrar partidas de futebol REAIS que acontecem HOJE ({dt_short}) ou AMANHÃ nas ligas: {leagues}
+Use Google Search para encontrar partidas de futebol REAIS que acontecem HOJE ({dt_short}) ou AMANHÃ nas ligas: {leagues}
 
-Depois busque as odds atuais dessas partidas na Betano, Bet365 ou Sportingbet.
+Busque também as odds atuais dessas partidas na Betano, Bet365 ou Sportingbet.
 Para médias de gols, use os últimos 5 jogos de cada time (Sofascore ou FlashScore).
 
-Responda SOMENTE com JSON puro, sem texto antes/depois, sem markdown, sem blocos de código:
+Responda SOMENTE com JSON puro, sem texto, sem markdown:
 
-{{"matches":[{{"homeTeam":"Nome do time","awayTeam":"Nome do time","league":"Liga","date":"{dt_short} HH:MM","homeAvgGoalsScored":1.4,"homeAvgGoalsConceded":1.0,"awayAvgGoalsScored":1.1,"awayAvgGoalsConceded":1.3,"odds":{{"home":2.20,"draw":3.10,"away":3.40,"over25":1.90,"under25":1.85,"btts":1.80}},"context":"informação relevante sobre o jogo"}}]}}
+{{"matches":[
+{{"homeTeam":"Nome do time","awayTeam":"Nome do time","league":"Liga","date":"{dt_short} HH:MM",
+"homeAvgGoalsScored":1.4,"homeAvgGoalsConceded":1.0,
+"awayAvgGoalsScored":1.1,"awayAvgGoalsConceded":1.3,
+"odds":{{"home":2.20,"draw":3.10,"away":3.40,"over25":1.90,"under25":1.85,"btts":1.80}},
+"context":"informação relevante sobre o jogo"}}
+]}}
 
-Inclua entre 5 e {max_m} partidas. Se não encontrar odd de um mercado use null. SOMENTE JSON."""
+Inclua entre 5 e {max_m} partidas reais. Use null para odds não encontradas. SOMENTE JSON."""
 
-ANALYSIS_PROMPT = """Analista de apostas. Seja objetivo e técnico.
+ANALYSIS_PROMPT = """Analista de apostas esportivas. Objetivo e técnico.
 
 {home} vs {away} — {league} — {date}
-Mercados com valor:
+Mercados com valor matemático:
 {opps}
 Contexto: {ctx}
 
 Responda em 3 partes (máx 120 palavras):
-1. VANTAGEM: por que o EV é positivo
-2. RISCO: o que pode invalidar
-3. ENTRADA: mercado exato e odd mínima"""
+1. VANTAGEM: por que o EV é positivo aqui
+2. RISCO: principal fator que pode invalidar
+3. ENTRADA: mercado exato e odd mínima aceitável"""
 
 async def scan(api_key, leagues, max_matches, banca, kfrac) -> Tuple[List[Dict], Dict]:
     log.info(f"Scan iniciado — {len(leagues)} ligas")
-    now = datetime.now()
+    now    = datetime.now()
     prompt = FETCH_PROMPT.format(
         dt=now.strftime("%d/%m/%Y %H:%M"),
         dt_short=now.strftime("%d/%m"),
         leagues=", ".join(leagues),
         max_m=max_matches,
     )
+    diag = {"matches_found":0,"matches_list":[],"ev_results":[],"errors":[],"ev_plus_count":0}
 
-    diag = {
-        "matches_found": 0,
-        "matches_list":  [],
-        "ev_results":    [],
-        "errors":        [],
-        "ev_plus_count": 0,
-    }
-
-    # ── Buscar partidas ───────────────────────────────────────────────────────
+    # ── Buscar dados via Gemini + Google Search ───────────────────────────────
     try:
-        raw = await call_claude(api_key, prompt, use_search=True)
-        log.info(f"Resposta recebida: {len(raw)} chars")
-        log.info(f"Preview: {raw[:400]}")
+        raw = await call_gemini(api_key, prompt, use_search=True)
+        log.info(f"Resposta Gemini: {len(raw)} chars | preview: {raw[:200]}")
         data    = parse_json(raw)
         matches = data.get("matches", [])
         diag["matches_found"] = len(matches)
         log.info(f"{len(matches)} partidas no JSON")
     except json.JSONDecodeError as e:
         err = f"JSON inválido: {str(e)[:100]}"
-        log.error(err)
-        diag["errors"].append(err)
+        log.error(err); diag["errors"].append(err)
         return [], diag
     except Exception as e:
-        err = f"Erro ao buscar: {str(e)[:150]}"
-        log.error(err)
-        diag["errors"].append(err)
+        err = f"Erro ao buscar: {str(e)[:200]}"
+        log.error(err); diag["errors"].append(err)
         return [], diag
 
     # ── Processar cada partida ────────────────────────────────────────────────
@@ -265,17 +271,14 @@ async def scan(api_key, leagues, max_matches, banca, kfrac) -> Tuple[List[Dict],
 
             required = ["homeTeam","awayTeam","homeAvgGoalsScored",
                         "homeAvgGoalsConceded","awayAvgGoalsScored","awayAvgGoalsConceded"]
-            missing = [f for f in required if not m.get(f)]
+            missing  = [f for f in required if not m.get(f)]
             if missing:
                 msg = f"{name}: campos faltando {missing}"
-                log.warning(msg)
-                diag["errors"].append(msg)
-                continue
+                log.warning(msg); diag["errors"].append(msg); continue
 
             markets = analyze_match(m, banca, kfrac)
             if not markets:
-                diag["ev_results"].append(f"❌ {name}: sem odds válidas")
-                continue
+                diag["ev_results"].append(f"❌ {name}: sem odds válidas"); continue
 
             best   = markets[0]
             ev_str = f"{name}: EV {best['ev_pct']:+.1f}% ({best['label']} @ {best['odds']:.2f})"
@@ -285,17 +288,16 @@ async def scan(api_key, leagues, max_matches, banca, kfrac) -> Tuple[List[Dict],
                 diag["ev_results"].append(f"✅ {ev_str}")
                 diag["ev_plus_count"] += 1
             else:
-                diag["ev_results"].append(f"➖ {ev_str}")
-                continue
+                diag["ev_results"].append(f"➖ {ev_str}"); continue
 
-            # Análise da IA
+            # Análise qualitativa
             try:
                 opps_txt = "\n".join(
                     f"{i+1}. {mk['label']}: EV {mk['ev_pct']:.1f}% | "
                     f"Edge {mk['edge_pct']:.1f}% | Odd {mk['odds']:.2f}"
                     for i, mk in enumerate(markets[:3])
                 )
-                ai_txt = await call_claude(api_key, ANALYSIS_PROMPT.format(
+                ai_txt = await call_gemini(api_key, ANALYSIS_PROMPT.format(
                     home=m["homeTeam"], away=m["awayTeam"],
                     league=m.get("league","?"), date=m.get("date","?"),
                     opps=opps_txt, ctx=m.get("context","N/A"),
@@ -317,24 +319,23 @@ async def scan(api_key, leagues, max_matches, banca, kfrac) -> Tuple[List[Dict],
             })
         except Exception as e:
             msg = f"Erro em {m.get('homeTeam','?')}: {str(e)[:80]}"
-            log.warning(msg)
-            diag["errors"].append(msg)
+            log.warning(msg); diag["errors"].append(msg)
 
     opportunities.sort(key=lambda x: x["ev_pct"], reverse=True)
-    log.info(f"Scan finalizado: {len(opportunities)} EV+ de {diag['matches_found']} partidas")
+    log.info(f"Scan: {len(opportunities)} EV+ de {diag['matches_found']} partidas")
     return opportunities, diag
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MENSAGENS TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════════════
 async def send_opportunity(token, chat_id, opp) -> bool:
-    nav = BETANO_PATH.get(opp["market_key"], ("Principais", opp["market_label"], opp["market_label"]))
+    nav     = BETANO_PATH.get(opp["market_key"], ("Principais",opp["market_label"],opp["market_label"]))
     tab, section, option = nav
     retorno = opp["stake"] * opp["odds"]
     lucro   = opp["stake"] * (opp["odds"] - 1)
     odd_min = round(opp["odds"] * 0.97, 2)
-    alt = [m for m in opp.get("all_markets",[])
-           if m["ev_pct"] > 0 and m["label"] != opp["market_label"]][:2]
+    alt     = [m for m in opp.get("all_markets",[])
+               if m["ev_pct"] > 0 and m["label"] != opp["market_label"]][:2]
     alt_txt = "\n".join(
         f"   • {m['label']} @ {m['odds']:.2f} — EV {m['ev_pct']:.1f}%" for m in alt
     ) or "   — Apenas este mercado tem EV positivo"
@@ -371,23 +372,22 @@ async def send_analysis(token, chat_id, opp) -> bool:
            f"{opp['ai_analysis'][:3000]}")
     return await tg_send(token, chat_id, msg)
 
-async def send_diagnostic(token, chat_id, diag: Dict, min_ev: float) -> bool:
-    """Envia relatório do scan — o que encontrou, EVs calculados, erros."""
+async def send_diagnostic(token, chat_id, diag, min_ev) -> bool:
     matches_txt = "\n".join(f"  • {m}" for m in diag["matches_list"][:10]) \
                   or "  Nenhuma partida encontrada"
-    ev_txt = "\n".join(f"  {e}" for e in diag["ev_results"][:10]) \
-             or "  Nenhum resultado"
-    errors_txt = "\n".join(f"  ⚠ {e}" for e in diag["errors"][:5]) if diag["errors"] else ""
-
+    ev_txt      = "\n".join(f"  {e}" for e in diag["ev_results"][:10]) \
+                  or "  Nenhum resultado"
+    errors_txt  = "\n".join(f"  ⚠ {e}" for e in diag["errors"][:5]) \
+                  if diag["errors"] else ""
     msg = (
         f"🔬 <b>DIAGNÓSTICO DO SCAN</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {datetime.now().strftime('%d/%m %H:%M')}\n\n"
         f"📊 Partidas encontradas: <b>{diag['matches_found']}</b>\n"
         f"✅ Com EV positivo: <b>{diag['ev_plus_count']}</b>\n"
-        f"📈 EV mínimo atual: <b>{min_ev:.1f}%</b>\n\n"
+        f"📈 EV mínimo: <b>{min_ev:.1f}%</b>\n\n"
         f"<b>Jogos encontrados:</b>\n{matches_txt}\n\n"
-        f"<b>Resultado EV por jogo:</b>\n{ev_txt}"
+        f"<b>EV por jogo:</b>\n{ev_txt}"
     )
     if errors_txt:
         msg += f"\n\n<b>Erros:</b>\n{errors_txt}"
@@ -397,11 +397,12 @@ async def send_startup(token, chat_id, cfg) -> bool:
     msg = (
         f"🟢 <b>BETTING AI ENGINE — ONLINE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 Motor: Google Gemini (gratuito)\n"
         f"💰 Banca: R$ {cfg.banca:.2f}\n"
         f"🛑 Stop loss: R$ {cfg.banca * cfg.stop_loss_pct / 100:.2f}\n"
         f"📈 EV mínimo: {cfg.min_ev_pct}%\n"
         f"🔄 Scan a cada {cfg.scan_interval_min} min\n"
-        f"🔬 Modo diagnóstico: {'ativo' if cfg.debug_mode else 'inativo'}\n"
+        f"🔬 Diagnóstico: {'ativo' if cfg.debug_mode else 'inativo'}\n"
         f"⚽ Ligas: {', '.join(cfg.leagues)}\n\n"
         f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
     )
@@ -451,7 +452,7 @@ class Memory:
         self._save()
 
     def get_adaptive_min_ev(self, base):
-        p = self.data["perf"]
+        p     = self.data["perf"]
         total = p["wins"] + p["losses"]
         if total < 20: return base
         wr = p["wins"] / total
@@ -467,13 +468,11 @@ async def run_cycle(cfg: Config, memory: Memory):
     log.info(f"Ciclo — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     try:
         opps, diag = await scan(
-            cfg.anthropic_api_key, cfg.leagues,
+            cfg.gemini_api_key, cfg.leagues,
             cfg.max_matches, cfg.banca, cfg.kelly_fraction,
         )
-
         min_ev = memory.get_adaptive_min_ev(cfg.min_ev_pct)
 
-        # Enviar diagnóstico a cada ciclo quando debug_mode=true
         if cfg.debug_mode:
             await send_diagnostic(cfg.telegram_token, cfg.telegram_chat_id, diag, min_ev)
 
@@ -491,8 +490,7 @@ async def run_cycle(cfg: Config, memory: Memory):
         for opp in filtered:
             key = f"{opp['home_team']}-{opp['away_team']}"
             if memory.already_sent_today(key, opp["market_key"]):
-                log.info(f"Já enviado hoje: {key}")
-                continue
+                log.info(f"Já enviado hoje: {key}"); continue
             ok = await send_opportunity(cfg.telegram_token, cfg.telegram_chat_id, opp)
             if ok:
                 await asyncio.sleep(1)
@@ -510,15 +508,14 @@ async def run_cycle(cfg: Config, memory: Memory):
 
 async def main():
     log.info("=" * 60)
-    log.info("🤖 BETTING AI ENGINE — INICIANDO")
+    log.info("🤖 BETTING AI ENGINE — INICIANDO (Gemini)")
     log.info("=" * 60)
 
     cfg = Config()
     try:
         cfg.validate()
     except ValueError as e:
-        log.error(str(e))
-        sys.exit(1)
+        log.error(str(e)); sys.exit(1)
 
     log.info(f"Banca: R${cfg.banca} | EV mín: {cfg.min_ev_pct}% | "
              f"Scan: {cfg.scan_interval_min}min | Debug: {cfg.debug_mode}")
@@ -526,10 +523,7 @@ async def main():
     memory = Memory()
 
     ok = await send_startup(cfg.telegram_token, cfg.telegram_chat_id, cfg)
-    if ok:
-        log.info("✅ Telegram OK")
-    else:
-        log.error("❌ Telegram falhou — verifique TOKEN e CHAT_ID")
+    log.info("✅ Telegram OK" if ok else "❌ Telegram falhou")
 
     cycle = 0
     while True:
