@@ -320,8 +320,8 @@ def _gemini_sync(api_key: str, prompt: str) -> str:
 
 async def call_gemini(api_key: str, prompt: str) -> str:
     if not api_key:
-        log.warning("GEMINI_API_KEY vazia — análise sem IA")
-        return ""
+        log.warning("GEMINI_API_KEY não configurada")
+        return "⚠️ GEMINI_API_KEY não configurada no Railway."
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(_executor, _gemini_sync, api_key, prompt)
@@ -329,7 +329,7 @@ async def call_gemini(api_key: str, prompt: str) -> str:
         return result
     except Exception as e:
         log.error(f"Gemini ERRO: {e}")
-        return ""
+        return f"⚠️ Erro Gemini: {str(e)[:200]}"
 
 ANALYSIS_PROMPT = """Analista de apostas esportivas. Objetivo e técnico.
 
@@ -409,7 +409,7 @@ async def send_opportunity(token, chat_id, opp) -> bool:
 async def send_analysis(token, chat_id, opp) -> bool:
     analysis = opp.get("ai_analysis", "")
     if not analysis:
-        return False
+        analysis = "Análise indisponível."
     msg = (f"🤖 <b>ANÁLISE DA IA</b>\n"
            f"{opp['home_team']} vs {opp['away_team']}\n"
            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
