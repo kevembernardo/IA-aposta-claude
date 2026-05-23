@@ -234,7 +234,7 @@ def fetch_team_stats(api_key: str, team_id: int, competition_id: str) -> Dict:
 # THE ODDS API — odds reais
 # ═══════════════════════════════════════════════════════════════════════════════
 SPORT_KEYS = {
-    "PL":  "soccer_england_league1",
+    "PL":  "soccer_epl",
     "PD":  "soccer_spain_la_liga",
     "SA":  "soccer_italy_serie_a",
     "BL1": "soccer_germany_bundesliga",
@@ -320,13 +320,16 @@ def _gemini_sync(api_key: str, prompt: str) -> str:
 
 async def call_gemini(api_key: str, prompt: str) -> str:
     if not api_key:
-        return "Análise indisponível (GEMINI_API_KEY não configurada)."
+        log.warning("GEMINI_API_KEY vazia — análise sem IA")
+        return ""
     loop = asyncio.get_event_loop()
     try:
-        return await loop.run_in_executor(_executor, _gemini_sync, api_key, prompt)
+        result = await loop.run_in_executor(_executor, _gemini_sync, api_key, prompt)
+        log.info(f"Gemini OK: {len(result)} chars")
+        return result
     except Exception as e:
-        log.warning(f"Gemini erro: {e}")
-        return "Análise indisponível."
+        log.error(f"Gemini ERRO: {e}")
+        return ""
 
 ANALYSIS_PROMPT = """Analista de apostas esportivas. Objetivo e técnico.
 
@@ -404,11 +407,13 @@ async def send_opportunity(token, chat_id, opp) -> bool:
     return await tg_send(token, chat_id, msg)
 
 async def send_analysis(token, chat_id, opp) -> bool:
-    if not opp.get("ai_analysis"): return False
+    analysis = opp.get("ai_analysis", "")
+    if not analysis:
+        return False
     msg = (f"🤖 <b>ANÁLISE DA IA</b>\n"
            f"{opp['home_team']} vs {opp['away_team']}\n"
            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-           f"{opp['ai_analysis'][:3000]}")
+           f"{analysis[:3000]}")
     return await tg_send(token, chat_id, msg)
 
 async def send_diagnostic(token, chat_id, diag, min_ev) -> bool:
