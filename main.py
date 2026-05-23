@@ -320,8 +320,8 @@ def _gemini_sync(api_key: str, prompt: str) -> str:
 
 async def call_gemini(api_key: str, prompt: str) -> str:
     if not api_key:
-        log.warning("GEMINI_API_KEY não configurada")
-        return "⚠️ GEMINI_API_KEY não configurada no Railway."
+        log.warning("GEMINI_API_KEY vazia — análise sem IA")
+        return ""
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(_executor, _gemini_sync, api_key, prompt)
@@ -329,7 +329,7 @@ async def call_gemini(api_key: str, prompt: str) -> str:
         return result
     except Exception as e:
         log.error(f"Gemini ERRO: {e}")
-        return f"⚠️ Erro Gemini: {str(e)[:200]}"
+        return ""
 
 ANALYSIS_PROMPT = """Analista de apostas esportivas. Objetivo e técnico.
 
@@ -407,13 +407,11 @@ async def send_opportunity(token, chat_id, opp) -> bool:
     return await tg_send(token, chat_id, msg)
 
 async def send_analysis(token, chat_id, opp) -> bool:
-    analysis = opp.get("ai_analysis", "")
-    if not analysis:
-        analysis = "Análise indisponível."
+    if not opp.get("ai_analysis"): return False
     msg = (f"🤖 <b>ANÁLISE DA IA</b>\n"
            f"{opp['home_team']} vs {opp['away_team']}\n"
            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-           f"{analysis[:3000]}")
+           f"{opp['ai_analysis'][:3000]}")
     return await tg_send(token, chat_id, msg)
 
 async def send_diagnostic(token, chat_id, diag, min_ev) -> bool:
@@ -617,12 +615,246 @@ class Memory:
         if wr < 0.38: return base * 1.25
         return base
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOTOR DE ESTRATÉGIA DIÁRIA
+# ═══════════════════════════════════════════════════════════════════════════════
+from itertools import combinations as _comb
+
+def _combined_odd(sels):
+    r = 1.0
+    for o in sels: r *= o["odds"]
+    return round(r, 2)
+
+def _combined_prob(sels):
+    r = 1.0
+    for o in sels: r *= o["real_prob"]
+    return r
+
+def _combined_ev(sels):
+    p = _combined_prob(sels)
+    od = _combined_odd(sels)
+    return calc_ev(p, od)
+
+def assess_day(opps, banca, min_ev):
+    strong = [o for o in opps if o["ev_pct"] >= min_ev + 2]
+    good   = [o for o in opps if o["ev_pct"] >= min_ev]
+    n      = len(good)
+    leagues = [o["league"] for o in good]
+    n_leagues = len(set(leagues))
+    diversified = n_leagues >= max(1, n // 2)
+
+    if n == 0:
+        return {
+            "rec": "AGUARDAR", "type": None, "sels": [],
+            "reason": "Nenhuma oportunidade com EV suficiente hoje.",
+            "action": "Não apostar hoje. Sistema continua monitorando.",
+            "risk": "NULO", "color": "⬜", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+        }
+
+    if n == 1:
+        o = good[0]
+        return {
+            "rec": "SIMPLES", "type": "single", "sels": [o],
+            "reason": "Apenas 1 oportunidade sólida. Múltipla não se justifica.",
+            "action": ("Aposte R$ %.2f em %s vs %s — %s @ %.2f" %
+                       (o["stake"], o["home_team"], o["away_team"], o["market_label"], o["odds"])),
+            "risk": "BAIXO", "color": "🟢", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+        }
+
+    if n == 2:
+        o1, o2 = good[0], good[1]
+        ev2 = _combined_ev([o1, o2])
+        od2 = _combined_odd([o1, o2])
+        p2  = _combined_prob([o1, o2])
+        if ev2 > 0.03 and diversified:
+            stake2 = round(banca * calc_kelly(p2, od2, 0.15), 2)
+            return {
+                "rec": "DUPLA", "type": "double", "sels": [o1, o2],
+                "comb_odd": od2, "comb_ev": round(ev2*100,1),
+                "comb_prob": round(p2*100,1), "stake": stake2,
+                "ret": round(stake2 * od2, 2),
+                "reason": ("2 seleções EV+ em ligas diferentes. EV combinado %.1f%% justifica dupla." % (ev2*100)),
+                "action": ("R$ %.2f na dupla (odd %.2f). Alternativa: simples separadas." % (stake2, od2)),
+                "risk": "MODERADO", "color": "🟡", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+            }
+        total_s = sum(o["stake"] for o in good[:2])
+        return {
+            "rec": "SIMPLES SEPARADAS", "type": "singles", "sels": good[:2],
+            "reason": ("2 oportunidades mas dupla tem EV baixo (%.1f%%) ou jogos correlacionados." % (ev2*100)),
+            "action": ("Aposte R$ %.2f e R$ %.2f separadamente." % (good[0]["stake"], good[1]["stake"])),
+            "total_stake": round(total_s, 2),
+            "risk": "BAIXO", "color": "🟢", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+        }
+
+    if n == 3:
+        top3 = good[:3]
+        ev3  = _combined_ev(top3)
+        od3  = _combined_odd(top3)
+        p3   = _combined_prob(top3)
+        if ev3 > 0.05 and diversified:
+            stake3 = round(banca * calc_kelly(p3, od3, 0.10), 2)
+            return {
+                "rec": "TRIPLA", "type": "treble", "sels": top3,
+                "comb_odd": od3, "comb_ev": round(ev3*100,1),
+                "comb_prob": round(p3*100,1), "stake": stake3,
+                "ret": round(stake3 * od3, 2),
+                "reason": ("3 seleções fortes com EV combinado %.1f%% e %d ligas diferentes." % (ev3*100, n_leagues)),
+                "action": ("R$ %.2f na tripla (odd %.2f). Considere também as 3 simples como proteção." % (stake3, od3)),
+                "risk": "MODERADO", "color": "🟡", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+            }
+        total_s = sum(o["stake"] for o in top3)
+        return {
+            "rec": "SIMPLES SEPARADAS", "type": "singles", "sels": top3,
+            "reason": ("3 oportunidades mas tripla não compensa (EV %.1f%%)." % (ev3*100)),
+            "action": "Aposte cada uma separadamente respeitando o Kelly.",
+            "total_stake": round(total_s, 2),
+            "risk": "BAIXO", "color": "🟢", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+        }
+
+    # 4+ seleções
+    if n >= 4 and len(strong) >= 3:
+        top4 = good[:4]
+        unit = round(banca * 0.005, 2)
+        min_od = min(_combined_odd(list(c)) for c in _comb(top4, 2))
+        best_ev2 = max(_combined_ev(list(c))*100 for c in _comb(top4, 2))
+        if n >= 5 and len(strong) >= 4:
+            top5 = good[:5]
+            unit5 = round(banca * 0.004, 2)
+            best_ev2_5 = max(_combined_ev(list(c))*100 for c in _comb(top5, 2))
+            return {
+                "rec": "CANADIAN", "type": "canadian", "sels": top5,
+                "count": 26, "unit": unit5, "total_stake": round(unit5*26, 2),
+                "max_ret": round(unit5 * _combined_odd(top5), 2),
+                "best_ev2": round(best_ev2_5, 1),
+                "reason": ("%d seleções EV+ hoje (%d ligas). Canadian: basta 2/5 acertarem." % (n, n_leagues)),
+                "action": ("26 apostas × R$ %.2f = R$ %.2f total." % (unit5, unit5*26)),
+                "risk": "ALTO", "color": "🔴", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+            }
+        return {
+            "rec": "YANKEE", "type": "yankee", "sels": top4,
+            "count": 11, "unit": unit, "total_stake": round(unit*11, 2),
+            "max_ret": round(unit * _combined_odd(top4), 2),
+            "min_od": round(min_od, 2), "best_ev2": round(best_ev2, 1),
+            "reason": ("%d seleções fortes. Yankee: basta 2/4 acertarem (odd mín. %.2f)." % (len(strong), min_od)),
+            "action": ("11 apostas × R$ %.2f = R$ %.2f total." % (unit, unit*11)),
+            "risk": "MODERADO-ALTO", "color": "🟠", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+        }
+
+    total_s = sum(o["stake"] for o in good)
+    return {
+        "rec": "SIMPLES SEPARADAS", "type": "singles", "sels": good,
+        "reason": ("%d oportunidades. Diversificação insuficiente para múltipla segura." % n),
+        "action": "Aposte cada uma separadamente respeitando o Kelly.",
+        "total_stake": round(total_s, 2),
+        "risk": "BAIXO", "color": "🟢", "n": n, "strong": len(strong), "n_leagues": n_leagues,
+    }
+
+
+async def send_strategy(token, chat_id, strat, banca, gemini_key):
+    rec   = strat["rec"]
+    color = strat["color"]
+    risk  = strat["risk"]
+    sels  = strat.get("sels", [])
+    n     = strat["n"]
+
+    sel_lines = []
+    for i, o in enumerate(sels):
+        sel_lines.append(
+            "  %d. %s vs %s\n     %s @ %.2f | EV +%.1f%% | Prob %.1f%%" %
+            (i+1, o["home_team"], o["away_team"],
+             o["market_label"], o["odds"], o["ev_pct"], o["real_prob"]*100)
+        )
+    sels_txt = "\n".join(sel_lines)
+
+    extra_lines = []
+    t = strat.get("type")
+    if t in ("double", "treble"):
+        extra_lines = [
+            "📊 Odd combinada: <b>%.2f</b>" % strat.get("comb_odd", 0),
+            "📈 EV combinado: <b>+%.1f%%</b>" % strat.get("comb_ev", 0),
+            "🎯 Prob. combinada: <b>%.1f%%</b>" % strat.get("comb_prob", 0),
+            "💰 Apostar: <b>R$ %.2f</b>" % strat.get("stake", 0),
+            "💵 Retorno potencial: <b>R$ %.2f</b>" % strat.get("ret", 0),
+        ]
+    elif t == "yankee":
+        extra_lines = [
+            "📋 11 apostas × R$ %.2f = <b>R$ %.2f total</b>" % (strat.get("unit",0), strat.get("total_stake",0)),
+            "🛡 Retorno mínimo (2/4): odd %.2f" % strat.get("min_od", 0),
+            "📈 Melhor dupla: EV +%.1f%%" % strat.get("best_ev2", 0),
+            "🏆 Retorno máximo (4/4): R$ %.2f" % strat.get("max_ret", 0),
+        ]
+    elif t == "canadian":
+        extra_lines = [
+            "📋 26 apostas × R$ %.2f = <b>R$ %.2f total</b>" % (strat.get("unit",0), strat.get("total_stake",0)),
+            "📈 Melhor dupla: EV +%.1f%%" % strat.get("best_ev2", 0),
+            "🏆 Retorno máximo: R$ %.2f" % strat.get("max_ret", 0),
+        ]
+    elif t in ("singles", "single"):
+        extra_lines = ["💰 Total alocado: <b>R$ %.2f</b>" % strat.get("total_stake", sum(o.get("stake",0) for o in sels))]
+
+    extra_txt = "\n".join(extra_lines)
+
+    msg = (
+        "📋 <b>ESTRATÉGIA DO DIA</b> — %s\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "%s <b>RECOMENDAÇÃO: %s</b>\n"
+        "⚖️ Risco: %s\n"
+        "📊 %d oportunidades | %d fortes | %d ligas\n\n"
+        "<b>Seleções:</b>\n%s\n\n"
+        "%s\n\n"
+        "<b>Motivo:</b> %s\n\n"
+        "<b>Como executar:</b>\n%s"
+    ) % (
+        datetime.now().strftime("%d/%m/%Y"),
+        color, rec, risk,
+        n, strat["strong"], strat["n_leagues"],
+        sels_txt, extra_txt,
+        strat.get("reason",""), strat.get("action",""),
+    )
+
+    ok = await tg_send(token, chat_id, msg)
+    await asyncio.sleep(2)
+
+    # Análise Gemini da estratégia
+    if sels and gemini_key:
+        sel_summary = "; ".join(
+            "%s vs %s %s @%.2f EV+%.1f%%" % (
+                o["home_team"], o["away_team"],
+                o["market_label"], o["odds"], o["ev_pct"]
+            ) for o in sels
+        )
+        prompt = (
+            "Analista de apostas. Data: %s. Banca: R$ %.2f.\n"
+            "Estratégia recomendada: %s (risco %s)\n"
+            "Seleções: %s\n"
+            "Motivo: %s\n\n"
+            "Analise em 4 partes (máx 180 palavras):\n"
+            "1. CONTEXTO DO DIA: qualidade das oportunidades\n"
+            "2. VALIDAÇÃO: concorda com a estratégia?\n"
+            "3. RISCOS: o que pode dar errado hoje\n"
+            "4. CONSELHO: como proceder"
+        ) % (
+            datetime.now().strftime("%d/%m/%Y"), banca,
+            rec, risk, sel_summary, strat.get("reason","")
+        )
+        ai_txt = await call_gemini(gemini_key, prompt)
+        if ai_txt:
+            ai_msg = (
+                "🧠 <b>ANÁLISE DA IA — ESTRATÉGIA</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n\n%s"
+            ) % ai_txt[:3500]
+            await tg_send(token, chat_id, ai_msg)
+
+    return ok
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOOP PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════════════
 async def run_cycle(cfg: Config, memory: Memory):
     log.info("=" * 50)
-    log.info(f"Ciclo — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    log.info("Ciclo — %s" % datetime.now().strftime('%d/%m/%Y %H:%M'))
     try:
         opps, diag = await scan(cfg)
         min_ev     = memory.get_adaptive_min_ev(cfg.min_ev_pct)
@@ -635,13 +867,18 @@ async def run_cycle(cfg: Config, memory: Memory):
             return
 
         filtered = [o for o in opps if o["ev_pct"] >= min_ev]
-        log.info(f"{len(filtered)} acima do EV mínimo ({min_ev:.1f}%)")
+        log.info("%d acima do EV mínimo (%.1f%%)" % (len(filtered), min_ev))
 
+        if not filtered:
+            return
+
+        # ── Enviar alertas individuais ────────────────────────────────────────
         sent = 0
         for opp in filtered:
-            key = f"{opp['home_team']}-{opp['away_team']}-{opp['market_key']}"
+            key = "%s-%s-%s" % (opp["home_team"], opp["away_team"], opp["market_key"])
             if memory.already_sent_today(key):
-                log.info(f"Já enviado hoje: {key}"); continue
+                log.info("Já enviado hoje: %s" % key)
+                continue
             ok = await send_opportunity(cfg.telegram_token, cfg.telegram_chat_id, opp)
             if ok:
                 await asyncio.sleep(1)
@@ -649,10 +886,29 @@ async def run_cycle(cfg: Config, memory: Memory):
                 memory.record(key, opp)
                 sent += 1
                 await asyncio.sleep(2)
-        log.info(f"{sent} alertas enviados")
+        log.info("%d alertas individuais enviados" % sent)
+
+        # ── Avaliar e enviar estratégia do dia ────────────────────────────────
+        strategy_key = "strategy-%s" % date.today().isoformat()
+        if not memory.already_sent_today(strategy_key):
+            log.info("Avaliando estratégia do dia...")
+            strat = assess_day(filtered, cfg.banca, min_ev)
+            await asyncio.sleep(3)
+            await send_strategy(
+                cfg.telegram_token, cfg.telegram_chat_id,
+                strat, cfg.banca, cfg.gemini_api_key
+            )
+            memory.record(strategy_key, {
+                "market_key": "strategy",
+                "league": "system",
+                "odds": 1.0,
+                "stake": 0,
+                "ev_pct": 0,
+            })
+            log.info("Estratégia do dia enviada: %s" % strat["rec"])
 
     except Exception as e:
-        log.error(f"Erro no ciclo: {e}", exc_info=True)
+        log.error("Erro no ciclo: %s" % e, exc_info=True)
         try: await send_error(cfg.telegram_token, cfg.telegram_chat_id, str(e))
         except Exception: pass
 
