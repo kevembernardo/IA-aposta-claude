@@ -146,11 +146,11 @@ def _gemini_call_sync(api_key: str, prompt: str, use_search: bool = False) -> st
 
     if use_search:
         # Gemini com Google Search grounding — busca real na web
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         tools = [{"google_search_retrieval": {}}]
         resp  = model.generate_content(prompt, tools=tools)
     else:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         resp  = model.generate_content(prompt)
 
     return resp.text or ""
