@@ -57,9 +57,14 @@ class Config:
         self.scan_interval_min    = int(os.getenv("SCAN_INTERVAL_MIN", "180"))
         self.debug_mode           = os.getenv("DEBUG_MODE", "true").lower() == "true"
         # IDs das ligas no football-data.org:
-        # PL=39(Premier), PD=140(La Liga), SA=135(Serie A),
-        # BL1=78(Bundesliga), FL1=61(Ligue1), BSA=71(Brasileirao), CL=2(Champions)
-        self.league_ids           = os.getenv("LEAGUE_IDS", "PL,PD,SA,BSA,CL").split(",")
+        # PL=Premier, PD=La Liga, SA=Serie A, BL1=Bundesliga, FL1=Ligue1
+        # BSA=Brasileirao, BSB=Serie B, CPB=Copa Brasil
+        # CL=Champions, EL=Europa League, ECL=Conference League
+        # CLI=Libertadores, CSA=Sul-Americana
+        # DED=Eredivisie, PPL=Liga Portugal, TUR=Super Lig
+        # WC=Copa do Mundo, EC=Eurocopa, NL=Nations League
+        # MLS=MLS, APD=Argentina, MXN=Liga MX
+        self.league_ids           = os.getenv("LEAGUE_IDS", "PL,PD,SA,BL1,FL1,BSA,CL,EL,CLI,CSA").split(",")
 
     def validate(self):
         errors = []
@@ -161,16 +166,48 @@ def http_get(url: str, headers: Dict = None) -> Optional[Dict]:
 # FOOTBALL-DATA.ORG — partidas e estatísticas
 # ═══════════════════════════════════════════════════════════════════════════════
 LEAGUE_NAMES = {
-    "PL":"Premier League","PD":"La Liga","SA":"Serie A",
-    "BL1":"Bundesliga","FL1":"Ligue 1","BSA":"Brasileirão","CL":"Champions League",
+    # Europa — Ligas nacionais
+    "PL":   "Premier League",
+    "PD":   "La Liga",
+    "SA":   "Serie A",
+    "BL1":  "Bundesliga",
+    "FL1":  "Ligue 1",
+    "DED":  "Eredivisie",
+    "PPL":  "Liga Portugal",
+    "PD2":  "Segunda Divisao Espanha",
+    "ELC":  "Championship (Ing)",
+    "SPL":  "Scottish Premiership",
+    "TUR":  "Super Lig Turquia",
+    # Europa — Copas
+    "CL":   "Champions League",
+    "EL":   "Europa League",
+    "ECL":  "Conference League",
+    "EC":   "Eurocopa",
+    "NL":   "Nations League",
+    "WC":   "Copa do Mundo",
+    # Americas
+    "BSA":  "Brasileirao Serie A",
+    "BSB":  "Brasileirao Serie B",
+    "CPB":  "Copa do Brasil",
+    "CLI":  "Libertadores",
+    "CSA":  "Sul-Americana",
+    "MLS":  "MLS",
+    "APD":  "Argentina Primera",
+    "MXN":  "Liga MX",
+    "COL":  "Liga Colombia",
+    "CHI":  "Primera Chile",
+    "URU":  "Primera Uruguay",
+    # Asia / Outros
+    "JPL":  "J-League",
+    "CSL":  "Chinese Super League",
 }
 
 def fetch_matches(api_key: str, league_ids: List[str]) -> List[Dict]:
     """Busca partidas das próximas 48h via football-data.org."""
     today    = date.today()
-    tomorrow = today + timedelta(days=1)
+    in_3_days = today + timedelta(days=2)
     date_from = today.strftime("%Y-%m-%d")
-    date_to   = tomorrow.strftime("%Y-%m-%d")
+    date_to   = in_3_days.strftime("%Y-%m-%d")
 
     headers  = {"X-Auth-Token": api_key}
     matches  = []
@@ -201,7 +238,8 @@ def fetch_matches(api_key: str, league_ids: List[str]) -> List[Dict]:
                 "date":     date_str,
                 "id":       m.get("id"),
             })
-        log.info(f"  {lid}: {len(data.get('matches',[]))} partidas")
+        n_found = len(data.get("matches",[]))
+        log.info("  %s (%s): %d partidas" % (lid, LEAGUE_NAMES.get(lid,lid), n_found))
 
     log.info(f"Total de partidas: {len(matches)}")
     return matches
@@ -234,13 +272,36 @@ def fetch_team_stats(api_key: str, team_id: int, competition_id: str) -> Dict:
 # THE ODDS API — odds reais
 # ═══════════════════════════════════════════════════════════════════════════════
 SPORT_KEYS = {
+    # Europa — ligas
     "PL":  "soccer_epl",
     "PD":  "soccer_spain_la_liga",
     "SA":  "soccer_italy_serie_a",
     "BL1": "soccer_germany_bundesliga",
     "FL1": "soccer_france_ligue_one",
-    "BSA": "soccer_brazil_campeonato",
+    "DED": "soccer_netherlands_eredivisie",
+    "PPL": "soccer_portugal_primeira_liga",
+    "ELC": "soccer_england_league1",
+    "SPL": "soccer_scotland_premiership",
+    "TUR": "soccer_turkey_super_league",
+    # Europa — copas
     "CL":  "soccer_uefa_champs_league",
+    "EL":  "soccer_uefa_europa_league",
+    "ECL": "soccer_uefa_europa_conference_league",
+    "EC":  "soccer_uefa_european_championship",
+    "NL":  "soccer_uefa_nations_league",
+    "WC":  "soccer_fifa_world_cup",
+    # Americas
+    "BSA": "soccer_brazil_campeonato",
+    "BSB": "soccer_brazil_serie_b",
+    "CPB": "soccer_brazil_copa_do_brasil",
+    "CLI": "soccer_conmebol_copa_libertadores",
+    "CSA": "soccer_conmebol_copa_sudamericana",
+    "MLS": "soccer_usa_mls",
+    "APD": "soccer_argentina_primera_division",
+    "MXN": "soccer_mexico_ligamx",
+    "COL": "soccer_colombia_primera_a",
+    # Asia
+    "JPL": "soccer_japan_j_league",
 }
 
 def fetch_odds(api_key: str, sport_key: str) -> List[Dict]:
@@ -287,7 +348,10 @@ def match_odds(match_name_home: str, match_name_away: str,
                odds_list: List[Dict]) -> Optional[Dict]:
     """Casa as odds com o jogo pelo nome do time."""
     def normalize(s):
-        return re.sub(r"[^a-z0-9]", "", s.lower())
+        import unicodedata
+        s = unicodedata.normalize("NFD", s.lower())
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+        return re.sub(r"[^a-z0-9]", "", s)
 
     nh = normalize(match_name_home)
     na = normalize(match_name_away)
@@ -504,9 +568,21 @@ async def scan(cfg: Config) -> Tuple[List[Dict], Dict]:
         # Usar médias padrão por liga (suficiente para Poisson)
         # Valores médios reais de cada liga:
         league_avgs = {
+            # Europa — ligas (gols_marcados_media, gols_sofridos_media)
             "PL":  (1.45, 1.10), "PD":  (1.35, 1.00), "SA":  (1.30, 1.00),
-            "BL1": (1.55, 1.15), "FL1": (1.25, 0.95), "BSA": (1.40, 1.05),
-            "CL":  (1.50, 1.10),
+            "BL1": (1.55, 1.15), "FL1": (1.25, 0.95), "DED": (1.55, 1.20),
+            "PPL": (1.35, 1.05), "ELC": (1.40, 1.10), "SPL": (1.50, 1.15),
+            "TUR": (1.45, 1.15),
+            # Europa — copas (mais equilibradas, menos gols)
+            "CL":  (1.50, 1.10), "EL":  (1.45, 1.10), "ECL": (1.40, 1.05),
+            "EC":  (1.25, 0.95), "NL":  (1.30, 1.00), "WC":  (1.20, 0.90),
+            # Americas
+            "BSA": (1.40, 1.05), "BSB": (1.35, 1.05), "CPB": (1.30, 1.00),
+            "CLI": (1.35, 1.00), "CSA": (1.30, 1.00), "MLS": (1.50, 1.15),
+            "APD": (1.45, 1.10), "MXN": (1.40, 1.05), "COL": (1.35, 1.05),
+            "CHI": (1.30, 1.00), "URU": (1.35, 1.05),
+            # Asia
+            "JPL": (1.35, 1.00), "CSL": (1.40, 1.05),
         }
         avg_s, avg_c = league_avgs.get(lid, (1.35, 1.05))
 
