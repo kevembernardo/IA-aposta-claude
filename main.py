@@ -126,21 +126,50 @@ BETANO_PATH = {
 
 def analyze_markets(home_avg_scored, home_avg_conceded,
                     away_avg_scored, away_avg_conceded,
-                    odds: Dict, banca: float, kfrac: float) -> List[Dict]:
+                    odds: Dict, banca: float, kfrac: float,
+                    has_real_data: bool = False) -> List[Dict]:
     lh    = home_avg_scored * away_avg_conceded
     la    = away_avg_scored * home_avg_conceded
     probs = match_probs(lh, la)
     results = []
+
+    # Com dados reais do time permite odds ate 5.00
+    # Com medias de liga limita a 3.50 (modelos genericos nao sao confiaveis em azaraos)
+    max_odds_allowed = 5.00 if has_real_data else 3.50
+
     for key, prob in probs.items():
         o = odds.get(key)
         if not o or o <= 1.01: continue
+
+        # Cap de odds por qualidade dos dados
+        if o > max_odds_allowed: continue
+
+        # Probabilidade minima — abaixo de 25% o modelo nao e confiavel
+        if prob < 0.25: continue
+
+        implied = 1.0 / o
+
+        # Divergencia excessiva: se o mercado ve < 30% e nosso modelo ve > 65%
+        # isso e sinal de dado ruim, nao de value bet
+        if implied < 0.30 and prob > 0.60: continue
+
         ev   = calc_ev(prob, o)
         edge = calc_edge(prob, o)
+
+        # Rejeitar EV negativo direto
+        if ev <= 0: continue
+
+        # Cap de EV realista:
+        # Com dados reais: max 20% (markets eficientes raramente dao mais)
+        # Com medias de liga: max 15%
+        ev_max = 0.20 if has_real_data else 0.15
+        if ev > ev_max: continue
+
         kf   = calc_kelly(prob, o, kfrac)
         lbl, emoji = classify(ev, edge)
         results.append({
             "key":key,"label":MARKET_LABELS.get(key,key),
-            "prob":prob,"implied":1/o,"odds":o,
+            "prob":prob,"implied":implied,"odds":o,
             "ev":ev,"ev_pct":ev*100,"edge_pct":edge,
             "kelly":kf,"stake":banca*kf,
             "cls_label":lbl,"cls_color":emoji,
@@ -202,7 +231,7 @@ LEAGUE_NAMES = {
     "CSL":  "Chinese Super League",
 }
 
-def fetch_matches(api_key: str, league_ids: List[str]) -> List[Dict]:
+def fetch_matches_with_ids(api_key: str, league_ids: List[str]) -> List[Dict]:
     """Busca partidas das próximas 48h via football-data.org."""
     today    = date.today()
     in_3_days = today + timedelta(days=2)
@@ -231,12 +260,14 @@ def fetch_matches(api_key: str, league_ids: List[str]) -> List[Dict]:
                 date_str = utc[:16]
 
             matches.append({
-                "homeTeam": home,
-                "awayTeam": away,
-                "league":   LEAGUE_NAMES.get(lid, lid),
+                "homeTeam":  home,
+                "awayTeam":  away,
+                "league":    LEAGUE_NAMES.get(lid, lid),
                 "league_id": lid,
-                "date":     date_str,
-                "id":       m.get("id"),
+                "date":      date_str,
+                "id":        m.get("id"),
+                "home_id":   m.get("homeTeam", {}).get("id"),
+                "away_id":   m.get("awayTeam", {}).get("id"),
             })
         n_found = len(data.get("matches",[]))
         log.info("  %s (%s): %d partidas" % (lid, LEAGUE_NAMES.get(lid,lid), n_found))
@@ -244,29 +275,50 @@ def fetch_matches(api_key: str, league_ids: List[str]) -> List[Dict]:
     log.info(f"Total de partidas: {len(matches)}")
     return matches
 
-def fetch_team_stats(api_key: str, team_id: int, competition_id: str) -> Dict:
-    """Busca médias de gols dos últimos jogos."""
-    url  = f"https://api.football-data.org/v4/teams/{team_id}/matches?limit=5&status=FINISHED"
-    data = http_get(url, {"X-Auth-Token": api_key})
-    if not data:
-        return {"scored": 1.3, "conceded": 1.3}
 
-    scored = conceded = count = 0
-    for m in data.get("matches", []):
-        score = m.get("score", {}).get("fullTime", {})
-        home_s = score.get("home", 0) or 0
-        away_s = score.get("away", 0) or 0
-        if m.get("homeTeam", {}).get("id") == team_id:
-            scored   += home_s
-            conceded += away_s
-        else:
-            scored   += away_s
-            conceded += home_s
-        count += 1
+def fetch_team_form(api_key, team_id, n=6):
+    url  = 'https://api.football-data.org/v4/teams/%d/matches?limit=%d&status=FINISHED' % (team_id, n)
+    data = http_get(url, {'X-Auth-Token': api_key})
+    if not data or not data.get('matches'):
+        return {'scored':1.3,'conceded':1.3,'form_score':0.5,
+                'home_scored':1.4,'home_conceded':1.2,
+                'away_scored':1.1,'away_conceded':1.4,'sample':0,'form_str':'-----'}
+    matches = data['matches']
+    scored_l=[]; conceded_l=[]; home_s=[]; home_c=[]; away_s=[]; away_c=[]; form_pts=[]
+    for m in matches:
+        score = m.get('score',{}).get('fullTime',{})
+        hs = score.get('home',0) or 0
+        as_ = score.get('away',0) or 0
+        is_home = m.get('homeTeam',{}).get('id') == team_id
+        s, c = (hs, as_) if is_home else (as_, hs)
+        scored_l.append(s); conceded_l.append(c)
+        (home_s if is_home else away_s).append(s)
+        (home_c if is_home else away_c).append(c)
+        form_pts.append(3 if s > c else (1 if s == c else 0))
+    ng = len(scored_l)
+    if ng == 0:
+        return {'scored':1.3,'conceded':1.3,'form_score':0.5,
+                'home_scored':1.4,'home_conceded':1.2,
+                'away_scored':1.1,'away_conceded':1.4,'sample':0,'form_str':'-----'}
+    # Peso exponencial — jogos recentes pesam mais (0.5^distancia)
+    ws = [0.5**(ng-1-i) for i in range(ng)]
+    def wavg(lst, w):
+        if not lst: return 0.0
+        w2=w[:len(lst)]; tw=sum(w2)
+        return sum(v*ww for v,ww in zip(lst,w2))/tw if tw>0 else sum(lst)/len(lst)
+    form_score = round(wavg(form_pts, ws)/3.0, 3)
+    return {
+        'scored':        round(wavg(scored_l, ws), 3),
+        'conceded':      round(wavg(conceded_l, ws), 3),
+        'form_score':    form_score,
+        'home_scored':   round(sum(home_s)/max(1,len(home_s)), 3),
+        'home_conceded': round(sum(home_c)/max(1,len(home_c)), 3),
+        'away_scored':   round(sum(away_s)/max(1,len(away_s)), 3),
+        'away_conceded': round(sum(away_c)/max(1,len(away_c)), 3),
+        'sample':        ng,
+        'form_str':      ''.join('V' if p==3 else 'E' if p==1 else 'D' for p in form_pts[-5:]),
+    }
 
-    if count == 0:
-        return {"scored": 1.3, "conceded": 1.3}
-    return {"scored": round(scored / count, 2), "conceded": round(conceded / count, 2)}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # THE ODDS API — odds reais
@@ -524,223 +576,340 @@ async def send_error(token, chat_id, error) -> bool:
 # SCANNER PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════════════
 async def scan(cfg: Config) -> Tuple[List[Dict], Dict]:
-    log.info(f"Scan iniciado — ligas: {cfg.league_ids}")
-    diag = {"matches_found":0,"with_odds":0,"matches_list":[],
-            "ev_results":[],"errors":[],"ev_plus_count":0}
+    log.info('Scan iniciado — %d ligas' % len(cfg.league_ids))
+    diag = {'matches_found':0,'with_odds':0,'matches_list':[],
+            'ev_results':[],'errors':[],'ev_plus_count':0}
+    loop = asyncio.get_event_loop()
 
-    # ── 1. Buscar partidas ────────────────────────────────────────────────────
-    loop    = asyncio.get_event_loop()
-    matches = await loop.run_in_executor(
-        _executor, fetch_matches, cfg.football_data_key, cfg.league_ids
+    # 1. Buscar partidas
+    matches_raw = await loop.run_in_executor(
+        _executor, fetch_matches_with_ids, cfg.football_data_key, cfg.league_ids
     )
-    diag["matches_found"] = len(matches)
-    if not matches:
-        diag["errors"].append("Nenhuma partida encontrada no football-data.org")
+    diag['matches_found'] = len(matches_raw)
+    if not matches_raw:
+        diag['errors'].append('Nenhuma partida encontrada')
         return [], diag
 
-    # ── 2. Buscar odds por liga ───────────────────────────────────────────────
-    odds_by_league: Dict[str, List[Dict]] = {}
+    # 2. Buscar odds por liga (paralelo)
+    odds_by_league = {}
     for lid in cfg.league_ids:
         sport_key = SPORT_KEYS.get(lid)
-        if not sport_key:
-            continue
-        odds_list = await loop.run_in_executor(
-            _executor, fetch_odds, cfg.odds_api_key, sport_key
-        )
+        if not sport_key: continue
+        odds_list = await loop.run_in_executor(_executor, fetch_odds, cfg.odds_api_key, sport_key)
         odds_by_league[lid] = odds_list
 
-    # ── 3. Cruzar partidas com odds e calcular EV ─────────────────────────────
+    # 3. Processar cada partida
     opportunities = []
-    for m in matches:
-        name = f"{m['homeTeam']} vs {m['awayTeam']}"
-        diag["matches_list"].append(name)
+    for m in matches_raw:
+        name = '%s vs %s' % (m['homeTeam'], m['awayTeam'])
+        diag['matches_list'].append(name)
+        lid = m.get('league_id', '')
 
-        # Buscar odds
-        lid       = m.get("league_id","")
+        # Odds
         odds_list = odds_by_league.get(lid, [])
-        odds      = match_odds(m["homeTeam"], m["awayTeam"], odds_list)
-
+        odds = match_odds(m['homeTeam'], m['awayTeam'], odds_list)
         if not odds or not any(v for v in odds.values() if v):
-            diag["ev_results"].append(f"❌ {name}: sem odds")
+            diag['ev_results'].append('❌ %s: sem odds' % name)
             continue
-        diag["with_odds"] += 1
+        diag['with_odds'] += 1
+        # Limitar odds a 4.50 quando usando medias de liga (sem dados reais)
+        # Isso e sobrescrito depois se tiver dados reais do time
 
-        # Usar médias padrão por liga (suficiente para Poisson)
-        # Valores médios reais de cada liga:
+        # Stats reais do time (se tiver ID e chave)
         league_avgs = {
-            # Europa — ligas (gols_marcados_media, gols_sofridos_media)
-            "PL":  (1.45, 1.10), "PD":  (1.35, 1.00), "SA":  (1.30, 1.00),
-            "BL1": (1.55, 1.15), "FL1": (1.25, 0.95), "DED": (1.55, 1.20),
-            "PPL": (1.35, 1.05), "ELC": (1.40, 1.10), "SPL": (1.50, 1.15),
-            "TUR": (1.45, 1.15),
-            # Europa — copas (mais equilibradas, menos gols)
-            "CL":  (1.50, 1.10), "EL":  (1.45, 1.10), "ECL": (1.40, 1.05),
-            "EC":  (1.25, 0.95), "NL":  (1.30, 1.00), "WC":  (1.20, 0.90),
-            # Americas
-            "BSA": (1.40, 1.05), "BSB": (1.35, 1.05), "CPB": (1.30, 1.00),
-            "CLI": (1.35, 1.00), "CSA": (1.30, 1.00), "MLS": (1.50, 1.15),
-            "APD": (1.45, 1.10), "MXN": (1.40, 1.05), "COL": (1.35, 1.05),
-            "CHI": (1.30, 1.00), "URU": (1.35, 1.05),
-            # Asia
-            "JPL": (1.35, 1.00), "CSL": (1.40, 1.05),
+            'PL':(1.45,1.10),'PD':(1.35,1.00),'SA':(1.30,1.00),
+            'BL1':(1.55,1.15),'FL1':(1.25,0.95),'DED':(1.55,1.20),
+            'PPL':(1.35,1.05),'ELC':(1.40,1.10),'SPL':(1.50,1.15),'TUR':(1.45,1.15),
+            'CL':(1.50,1.10),'EL':(1.45,1.10),'ECL':(1.40,1.05),
+            'EC':(1.25,0.95),'NL':(1.30,1.00),'WC':(1.20,0.90),
+            'BSA':(1.40,1.05),'BSB':(1.35,1.05),'CPB':(1.30,1.00),
+            'CLI':(1.35,1.00),'CSA':(1.30,1.00),'MLS':(1.50,1.15),
+            'APD':(1.45,1.10),'MXN':(1.40,1.05),'COL':(1.35,1.05),
+            'CHI':(1.30,1.00),'URU':(1.35,1.05),'JPL':(1.35,1.00),'CSL':(1.40,1.05),
         }
         avg_s, avg_c = league_avgs.get(lid, (1.35, 1.05))
+        home_id = m.get('home_id')
+        away_id = m.get('away_id')
 
-        # Casa marca mais, fora concede mais (fator campo)
-        home_scored   = avg_s * 1.10
-        home_conceded = avg_c * 0.90
-        away_scored   = avg_s * 0.90
-        away_conceded = avg_c * 1.10
+        # Dados reais por time (quando disponivel)
+        home_form = away_form = None
+        if cfg.football_data_key and home_id and away_id:
+            try:
+                home_form = await loop.run_in_executor(_executor, fetch_team_form, cfg.football_data_key, home_id, 6)
+                away_form = await loop.run_in_executor(_executor, fetch_team_form, cfg.football_data_key, away_id, 6)
+            except Exception as e:
+                log.warning('Erro ao buscar form: %s' % e)
 
-        markets = analyze_markets(
-            home_scored, home_conceded,
-            away_scored, away_conceded,
-            odds, cfg.banca, cfg.kelly_fraction
-        )
+        # Calcular lambdas com dados reais ou fallback para media da liga
+        if home_form and home_form['sample'] >= 3 and away_form and away_form['sample'] >= 3:
+            # Dados reais: casa usa home_scored, fora usa away_scored
+            home_attack  = home_form['home_scored']   if home_form['home_scored'] > 0 else home_form['scored']
+            home_defense = home_form['home_conceded'] if home_form['home_conceded'] > 0 else home_form['conceded']
+            away_attack  = away_form['away_scored']   if away_form['away_scored'] > 0 else away_form['scored']
+            away_defense = away_form['away_conceded'] if away_form['away_conceded'] > 0 else away_form['conceded']
+            # Ajuste de forma: time em boa forma marca mais / sofre menos
+            home_attack  *= (0.85 + 0.30 * home_form['form_score'])
+            home_defense *= (1.15 - 0.30 * home_form['form_score'])
+            away_attack  *= (0.85 + 0.30 * away_form['form_score'])
+            away_defense *= (1.15 - 0.30 * away_form['form_score'])
+            data_source = 'real'
+            form_str = '%s | %s' % (home_form['form_str'], away_form['form_str'])
+        else:
+            # Fallback: media da liga + fator campo
+            home_attack  = avg_s * 1.10
+            home_defense = avg_c * 0.90
+            away_attack  = avg_s * 0.90
+            away_defense = avg_c * 1.10
+            data_source = 'liga'
+            form_str = 'N/D'
+
+        markets = analyze_markets(home_attack, home_defense, away_attack, away_defense,
+                                  odds, cfg.banca, cfg.kelly_fraction,
+                                  has_real_data=(data_source == 'real'))
         if not markets:
-            diag["ev_results"].append(f"❌ {name}: sem mercados válidos")
+            diag['ev_results'].append('❌ %s: sem mercados validos' % name)
             continue
 
         best   = markets[0]
-        ev_str = f"{name}: EV {best['ev_pct']:+.1f}% ({best['label']} @ {best['odds']:.2f})"
-        log.info(f"  {ev_str}")
+        ev_str = '%s: EV %+.1f%% (%s @ %.2f) [%s]' % (
+            name, best['ev_pct'], best['label'], best['odds'], data_source)
+        log.info('  ' + ev_str)
 
-        if best["ev_pct"] > 0:
-            diag["ev_results"].append(f"✅ {ev_str}")
-            diag["ev_plus_count"] += 1
+        if best['ev_pct'] > 0:
+            diag['ev_results'].append('✅ ' + ev_str)
+            diag['ev_plus_count'] += 1
         else:
-            diag["ev_results"].append(f"➖ {ev_str}")
+            diag['ev_results'].append('➖ ' + ev_str)
             continue
 
-        # Análise qualitativa via Gemini
-        lh = home_scored * away_conceded
-        la = away_scored * home_conceded
-        try:
-            opps_txt = "\n".join(
-                f"{i+1}. {mk['label']}: EV {mk['ev_pct']:.1f}% | "
-                f"Edge {mk['edge_pct']:.1f}% | Odd {mk['odds']:.2f}"
-                for i, mk in enumerate(markets[:3])
-            )
-            ai_txt = await call_gemini(cfg.gemini_api_key, ANALYSIS_PROMPT.format(
-                home=m["homeTeam"], away=m["awayTeam"],
-                league=m["league"], date=m["date"],
-                lh=lh, la=la, opps=opps_txt,
-            ))
-        except Exception:
-            ai_txt = "Análise indisponível."
-
+        # Analise Gemini — apenas para os top 5 por EV (controlado depois)
+        lh = home_attack * away_defense
+        la = away_attack * home_defense
         opportunities.append({
-            "home_team":m["homeTeam"],"away_team":m["awayTeam"],
-            "league":m["league"],"date":m["date"],
-            "market_key":best["key"],"market_label":best["label"],
-            "odds":best["odds"],"real_prob":best["prob"],
-            "implied_prob":best["implied"],"ev_pct":best["ev_pct"],
-            "edge_pct":best["edge_pct"],"kelly":best["kelly"],
-            "stake":best["stake"],"cls_label":best["cls_label"],
-            "cls_color":best["cls_color"],"all_markets":markets,
-            "ai_analysis":ai_txt,
+            'home_team': m['homeTeam'], 'away_team': m['awayTeam'],
+            'league': m['league'], 'date': m['date'],
+            'home_form': home_form, 'away_form': away_form,
+            'form_str': form_str, 'data_source': data_source,
+            'lh': round(lh,3), 'la': round(la,3),
+            'market_key': best['key'], 'market_label': best['label'],
+            'odds': best['odds'], 'real_prob': best['prob'],
+            'implied_prob': best['implied'], 'ev_pct': best['ev_pct'],
+            'edge_pct': best['edge_pct'], 'kelly': best['kelly'],
+            'stake': best['stake'], 'cls_label': best['cls_label'],
+            'cls_color': best['cls_color'], 'all_markets': markets,
+            'ai_analysis': '',
         })
 
-    opportunities.sort(key=lambda x: x["ev_pct"], reverse=True)
-    log.info(f"Scan: {len(opportunities)} EV+ de {diag['matches_found']} partidas")
+    opportunities.sort(key=lambda x: x['ev_pct'], reverse=True)
+
+    # Gemini apenas para top 3 — evita quota 429
+    for i, opp in enumerate(opportunities[:3]):
+        try:
+            opps_txt = '\n'.join(
+                '%d. %s: EV %.1f%% | Edge %.1f%% | Odd %.2f' %
+                (j+1, mk['label'], mk['ev_pct'], mk['edge_pct'], mk['odds'])
+                for j, mk in enumerate(opp['all_markets'][:3])
+            )
+            hf = opp.get('home_form') or {}
+            af = opp.get('away_form') or {}
+            form_context = ''
+            if hf.get('sample',0) >= 3:
+                form_context = ('Forma: %s(casa) gols %.1f/%.1f | %s(fora) gols %.1f/%.1f' % (
+                    opp['home_team'], hf.get('scored',0), hf.get('conceded',0),
+                    opp['away_team'], af.get('scored',0), af.get('conceded',0)))
+            prompt = (
+                'Analista quantitativo de apostas. Tecnico e direto.\n'
+                '%s vs %s — %s — %s\n'
+                'Lambda casa: %.3f gols/jogo | Lambda fora: %.3f gols/jogo\n'
+                'Fonte dos dados: %s\n'
+                '%s\n'
+                'Forma recente: %s\n\n'
+                'Mercados EV+:\n%s\n\n'
+                '3 partes (max 130 palavras):\n'
+                '1. VANTAGEM MATEMATICA\n'
+                '2. RISCO PRINCIPAL\n'
+                '3. ENTRADA RECOMENDADA (mercado + odd minima)'
+            ) % (
+                opp['home_team'], opp['away_team'], opp['league'], opp['date'],
+                opp['lh'], opp['la'], opp['data_source'], form_context,
+                opp['form_str'], opps_txt,
+            )
+            opp['ai_analysis'] = await call_gemini(cfg.gemini_api_key, prompt)
+            if i < 2: await asyncio.sleep(5)
+        except Exception as e:
+            log.warning('Gemini erro: %s' % e)
+            opp['ai_analysis'] = ''
+
+    log.info('Scan: %d EV+ de %d partidas (%d com odds)' % (
+        len(opportunities), diag['matches_found'], diag['with_odds']))
     return opportunities, diag
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MEMÓRIA
-# ═══════════════════════════════════════════════════════════════════════════════
 class Memory:
-    def __init__(self, path="data/history.json"):
+    def __init__(self, path='data/history.json'):
         self.path = path
         self.data = self._load()
 
     def _load(self):
         if os.path.exists(self.path):
             try:
-                with open(self.path,"r",encoding="utf-8") as f: return json.load(f)
+                with open(self.path,'r',encoding='utf-8') as f: return json.load(f)
             except Exception: pass
-        return {"tips":[],"perf":{"sent":0,"wins":0,"losses":0,"staked":0.0,"returned":0.0},"banca":None}
+        return {'tips':[],'perf':{'sent':0,'wins':0,'losses':0,'staked':0.0,'returned':0.0},'banca':None,'silent_until':None}
 
     def _save(self):
         try:
-            with open(self.path,"w",encoding="utf-8") as f:
+            with open(self.path,'w',encoding='utf-8') as f:
                 json.dump(self.data,f,ensure_ascii=False,indent=2)
-        except Exception as e: log.error("Erro ao salvar: %s" % e)
+        except Exception as e: log.error('Erro ao salvar: %s' % e)
 
-    def get_banca(self, cfg_banca):
-        """Retorna banca salva na memoria, ou a do config se nao houver."""
-        return self.data.get("banca") or cfg_banca
+    # ── BANCA ─────────────────────────────────────────────────────────────────
+    def get_banca(self, cfg_banca): return self.data.get('banca') or cfg_banca
 
     def set_banca(self, valor):
-        """Atualiza banca manualmente."""
-        self.data["banca"] = round(float(valor), 2)
+        self.data['banca'] = round(float(valor), 2)
         self._save()
-        log.info("Banca atualizada para R$ %.2f" % valor)
+        log.info('Banca atualizada: R$ %.2f' % valor)
 
     def registrar_resultado(self, ganhou, valor):
-        """Registra resultado de aposta e atualiza banca automaticamente."""
-        banca_atual = self.data.get("banca", 0) or 0
-        p = self.data["perf"]
+        banca = self.data.get('banca', 0) or 0
+        p = self.data['perf']
         if ganhou:
-            p["wins"]    += 1
-            p["returned"] = p.get("returned", 0) + valor
-            nova_banca   = round(banca_atual + valor, 2)
+            p['wins']     += 1
+            p['returned']  = p.get('returned',0) + valor
+            nova = round(banca + valor, 2)
         else:
-            p["losses"]  += 1
-            p["staked"]   = p.get("staked", 0) + valor
-            nova_banca   = round(banca_atual - valor, 2)
-        nova_banca = max(0, nova_banca)
-        self.data["banca"] = nova_banca
+            p['losses']   += 1
+            p['staked']    = p.get('staked',0) + valor
+            nova = round(max(0, banca - valor), 2)
+        self.data['banca'] = nova
         self._save()
-        return nova_banca
+        return nova
 
-    def get_stats(self):
-        p     = self.data["perf"]
-        total = p["wins"] + p["losses"]
-        wr    = (p["wins"] / total * 100) if total > 0 else 0
-        staked   = p.get("staked", 0)
-        returned = p.get("returned", 0)
-        roi   = ((returned - staked) / staked * 100) if staked > 0 else 0
-        return {
-            "banca":    self.data.get("banca", 0),
-            "enviados": p["sent"],
-            "wins":     p["wins"],
-            "losses":   p["losses"],
-            "total":    total,
-            "win_rate": round(wr, 1),
-            "roi":      round(roi, 1),
-            "staked":   round(staked, 2),
-            "returned": round(returned, 2),
-        }
+    # ── MODO SILENCIOSO ───────────────────────────────────────────────────────
+    def is_silent(self):
+        until = self.data.get('silent_until')
+        if not until: return False
+        from datetime import datetime as _dt
+        try:
+            return _dt.now() < _dt.fromisoformat(until)
+        except Exception: return False
 
+    def set_silent(self, hours):
+        from datetime import datetime as _dt, timedelta as _td
+        until = (_dt.now() + _td(hours=hours)).isoformat()
+        self.data['silent_until'] = until
+        self._save()
+        return until
+
+    def clear_silent(self):
+        self.data['silent_until'] = None
+        self._save()
+
+    # ── HISTORICO ─────────────────────────────────────────────────────────────
     def already_sent_today(self, key) -> bool:
         today = date.today().isoformat()
-        return any(t["match"]==key and t["date"]==today for t in self.data["tips"])
+        return any(t['match']==key and t['date']==today for t in self.data['tips'])
 
     def record(self, key, opp):
-        self.data["tips"].append({
-            "match":key,"market":opp["market_key"],
-            "league":opp["league"],"odds":opp["odds"],
-            "stake":opp["stake"],"ev_pct":opp["ev_pct"],
-            "date":date.today().isoformat(),"outcome":None,
+        self.data['tips'].append({
+            'match':key,'market':opp.get('market_key',''),
+            'league':opp.get('league',''),'odds':opp.get('odds',0),
+            'stake':opp.get('stake',0),'ev_pct':opp.get('ev_pct',0),
+            'date':date.today().isoformat(),'outcome':None,
+            'home_team':opp.get('home_team',''),'away_team':opp.get('away_team',''),
         })
-        self.data["perf"]["sent"] += 1
-        if len(self.data["tips"]) > 500:
-            self.data["tips"] = self.data["tips"][-500:]
+        self.data['perf']['sent'] += 1
+        if len(self.data['tips']) > 1000:
+            self.data['tips'] = self.data['tips'][-1000:]
         self._save()
 
+    def get_pending_results(self, days_back=2):
+        from datetime import datetime as _dt, timedelta as _td
+        cutoff = (_dt.now() - _td(days=days_back)).date().isoformat()
+        return [
+            t for t in self.data['tips']
+            if t.get('outcome') is None
+            and t.get('market','') != 'strategy'
+            and t.get('date','') >= cutoff
+            and t.get('home_team','')
+        ]
+
+    def update_outcome(self, tip_id_or_match, outcome, returned=0.0):
+        for t in self.data['tips']:
+            if t.get('match') == tip_id_or_match and t.get('outcome') is None:
+                t['outcome']  = outcome
+                t['returned'] = returned
+                p = self.data['perf']
+                if outcome == 'win':
+                    p['wins']     += 1
+                    p['returned']  = p.get('returned',0) + returned
+                    banca = self.data.get('banca',0) or 0
+                    self.data['banca'] = round(banca + returned - t.get('stake',0), 2)
+                elif outcome == 'loss':
+                    p['losses']  += 1
+                    p['staked']   = p.get('staked',0) + t.get('stake',0)
+                self._save()
+                return True
+        return False
+
+    # ── ESTATISTICAS ──────────────────────────────────────────────────────────
+    def get_stats(self):
+        p = self.data['perf']
+        total = p['wins'] + p['losses']
+        wr    = (p['wins']/total*100) if total > 0 else 0
+        staked   = p.get('staked',0)
+        returned = p.get('returned',0)
+        roi = ((returned-staked)/staked*100) if staked > 0 else 0
+        return {
+            'banca':    self.data.get('banca',0),
+            'enviados': p['sent'], 'wins': p['wins'], 'losses': p['losses'],
+            'total': total, 'win_rate': round(wr,1), 'roi': round(roi,1),
+            'staked': round(staked,2), 'returned': round(returned,2),
+        }
+
+    def get_weekly_stats(self):
+        from datetime import datetime as _dt, timedelta as _td
+        week_ago = (_dt.now() - _td(days=7)).date().isoformat()
+        tips = [t for t in self.data['tips'] if t.get('date','') >= week_ago and t.get('market','') != 'strategy']
+        wins    = sum(1 for t in tips if t.get('outcome')=='win')
+        losses  = sum(1 for t in tips if t.get('outcome')=='loss')
+        staked  = sum(t.get('stake',0) for t in tips if t.get('outcome') in ('win','loss'))
+        returned= sum(t.get('returned',0) for t in tips if t.get('outcome')=='win')
+        roi     = ((returned-staked)/staked*100) if staked > 0 else 0
+        best    = max((t for t in tips if t.get('outcome')=='win'), key=lambda x: x.get('returned',0), default=None)
+        worst   = max((t for t in tips if t.get('outcome')=='loss'), key=lambda x: x.get('stake',0), default=None)
+        by_league = {}
+        for t in tips:
+            lg = t.get('league','?')
+            if lg not in by_league: by_league[lg] = {'w':0,'l':0}
+            if t.get('outcome')=='win': by_league[lg]['w'] += 1
+            elif t.get('outcome')=='loss': by_league[lg]['l'] += 1
+        return {
+            'total': len(tips), 'wins': wins, 'losses': losses,
+            'pending': len(tips)-wins-losses,
+            'staked': round(staked,2), 'returned': round(returned,2),
+            'roi': round(roi,1),
+            'win_rate': round(wins/(wins+losses)*100,1) if (wins+losses)>0 else 0,
+            'best': best, 'worst': worst,
+            'by_league': by_league,
+        }
+
+    def needs_weekly_report(self):
+        today = date.today()
+        if today.weekday() != 6: return False  # so domingo
+        key = 'weekly-report-%s' % today.isoformat()
+        return not self.already_sent_today(key)
+
     def get_adaptive_min_ev(self, base):
-        p = self.data["perf"]
-        total = p["wins"] + p["losses"]
+        p = self.data['perf']
+        total = p['wins'] + p['losses']
         if total < 20: return base
-        wr = p["wins"] / total
-        if wr > 0.58: return max(base * 0.85, 2.0)
-        if wr < 0.38: return base * 1.25
+        wr = p['wins'] / total
+        if wr > 0.58: return max(base*0.85, 2.0)
+        if wr < 0.38: return base*1.25
         return base
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MOTOR DE ESTRATÉGIA DIÁRIA
-# ═══════════════════════════════════════════════════════════════════════════════
 from itertools import combinations as _comb
 
 def _combined_odd(sels):
@@ -768,7 +937,7 @@ def get_banca_mode(banca):
             "nome": "SOBREVIVENCIA", "emoji": "🔴",
             "descricao": "Banca crítica — foco em preservação e alavancagem segura",
             "kelly_frac": 0.08, "max_apostas": 1,
-            "min_prob": 0.55, "min_odds": 1.50, "max_odds": 2.30,
+            "min_prob": 0.48, "min_odds": 1.40, "max_odds": 5.00,
             "min_ev": 4.0, "dupla_ok": True,
             "dupla_min_prob": 0.58, "dupla_min_ev": 0.05, "kelly_dupla": 0.10,
             "tripla_ok": False, "yankee_ok": False, "canadian_ok": False,
@@ -814,10 +983,20 @@ def get_banca_mode(banca):
 
 
 def filter_by_mode(opps, mode, banca):
+    """
+    Filtra oportunidades pelo modo de banca.
+    - min_prob: probabilidade minima calculada pelo Poisson
+    - max_odds: apenas para ESTRATEGIA (multiplas) — alertas individuais aceitam ate 5.00
+    - min_ev: EV minimo configurado
+    """
     result = []
     for o in opps:
+        # Filtro de probabilidade minima — garante qualidade do modelo
         if o["real_prob"] < mode["min_prob"]: continue
-        if not (mode["min_odds"] <= o["odds"] <= mode["max_odds"]): continue
+        # Filtro de odds para alerta individual: 1.30 ate 5.00
+        # (acima de 5.00 o modelo com medias de liga nao e confiavel)
+        if not (mode["min_odds"] <= o["odds"] <= 5.00): continue
+        # Filtro de EV minimo
         if o["ev_pct"] < mode["min_ev"]: continue
         kf    = mode["kelly_frac"]
         stake = banca * calc_kelly(o["real_prob"], o["odds"], kf)
@@ -1117,6 +1296,60 @@ def tg_get_updates_sync(token, offset=0):
         return []
 
 
+async def send_weekly_report(token, chat_id, memory, gemini_key):
+    stats = memory.get_weekly_stats()
+    w = stats
+    by_league_txt = ""
+    for lg, s in sorted(w["by_league"].items(), key=lambda x: x[1]["w"]+x[1]["l"], reverse=True)[:5]:
+        wr = round(s["w"]/(s["w"]+s["l"])*100,0) if (s["w"]+s["l"])>0 else 0
+        by_league_txt += "  %s: %dV %dD (%.0f%%)\n" % (lg, s["w"], s["l"], wr)
+
+    best_txt  = ("%s vs %s +R$%.2f" % (w["best"]["home_team"],  w["best"]["away_team"],  w["best"].get("returned",0)))  if w.get("best")  else "—"
+    worst_txt = ("%s vs %s -R$%.2f" % (w["worst"]["home_team"], w["worst"]["away_team"], w["worst"].get("stake",0)))    if w.get("worst") else "—"
+
+    msg = (
+        "📊 <b>RELATORIO SEMANAL</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📅 Semana encerrada em %s\n\n"
+        "📤 Sinais enviados: <b>%d</b>\n"
+        "✅ Vitorias: <b>%d</b>\n"
+        "❌ Derrotas: <b>%d</b>\n"
+        "⏳ Pendentes: <b>%d</b>\n"
+        "🎯 Win rate: <b>%.1f%%</b>\n"
+        "💰 Total apostado: R$ %.2f\n"
+        "💵 Total retornado: R$ %.2f\n"
+        "📈 ROI da semana: <b>%+.1f%%</b>\n\n"
+        "<b>Por liga:</b>\n%s\n"
+        "<b>Melhor entrada:</b> %s\n"
+        "<b>Pior entrada:</b> %s\n\n"
+        "Sistema continua monitorando. 💪"
+    ) % (
+        date.today().strftime("%d/%m/%Y"),
+        w["total"], w["wins"], w["losses"], w["pending"],
+        w["win_rate"], w["staked"], w["returned"], w["roi"],
+        by_league_txt or "  Sem dados\n",
+        best_txt, worst_txt,
+    )
+    ok = await tg_send(token, chat_id, msg)
+
+    # Analise Gemini do desempenho semanal
+    if gemini_key and w["total"] > 0:
+        prompt = (
+            "Analista de apostas. Avalie o desempenho semanal:\n"
+            "Sinais: %d | Vitorias: %d | Derrotas: %d | Win rate: %.1f%% | ROI: %+.1f%%\n"
+            "Apostado: R$ %.2f | Retornado: R$ %.2f\n"
+            "Responda em 3 partes (max 150 palavras):\n"
+            "1. AVALIACAO: como foi a semana matematicamente\n"
+            "2. PADROES: o que os resultados indicam\n"
+            "3. AJUSTE: o que mudar na proxima semana"
+        ) % (w["total"], w["wins"], w["losses"], w["win_rate"], w["roi"], w["staked"], w["returned"])
+        ai = await call_gemini(gemini_key, prompt)
+        if ai:
+            await tg_send(token, chat_id,
+                "🧠 <b>ANALISE SEMANAL DA IA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n%s" % ai[:3000])
+    return ok
+
+
 async def process_commands(cfg, memory):
     """Verifica mensagens no Telegram e processa comandos."""
     loop = asyncio.get_event_loop()
@@ -1230,6 +1463,29 @@ async def process_commands(cfg, memory):
                 stats["win_rate"], stats["roi"],
                 today_str))
 
+        elif cmd == "/silencio":
+            horas = int(parts[1]) if len(parts) > 1 else 8
+            until = memory.set_silent(horas)
+            await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
+                "🔇 <b>Modo silencioso ativado por %d horas.</b>\n"
+                "Scans continuam mas alertas pausados ate %s.\n"
+                "Use /ativar para reativar." % (horas, until[:16]))
+
+        elif cmd == "/ativar":
+            memory.clear_silent()
+            await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
+                "🔊 <b>Alertas reativados!</b> Sistema voltou ao normal.")
+
+        elif cmd == "/relatorio":
+            await send_weekly_report(cfg.telegram_token, cfg.telegram_chat_id, memory, cfg.gemini_api_key)
+
+        elif cmd == "/ligas":
+            ligas_txt = "\n".join("  %s — %s" % (k,v) for k,v in sorted(LEAGUE_NAMES.items()))
+            await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
+                "⚽ <b>LIGAS SUPORTADAS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n%s\n\n"
+                "Para ativar, va em Railway → Variables → LEAGUE_IDS\n"
+                "Exemplo: PL,PD,BSA,CLI,CSA" % ligas_txt)
+
         elif cmd == "/ajuda":
             await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
                 "🤖 <b>COMANDOS DISPONIVEIS</b>\n\n"
@@ -1237,6 +1493,10 @@ async def process_commands(cfg, memory):
                 "/ganhou 47.20 — registra vitoria (lucro)\n"
                 "/perdeu 13.08 — registra derrota (valor apostado)\n"
                 "/status — banca, modo e historico\n"
+                "/silencio 8 — silenciar por 8 horas\n"
+                "/ativar — reativar alertas\n"
+                "/relatorio — relatorio semanal\n"
+                "/ligas — ligas disponiveis\n"
                 "/ajuda — esta mensagem")
 
     # Salvar offset
@@ -1250,29 +1510,46 @@ async def run_cycle(cfg: Config, memory: Memory):
     log.info("=" * 50)
     log.info("Ciclo — %s" % datetime.now().strftime("%d/%m/%Y %H:%M"))
     try:
-        # Usar banca da memoria (atualizada pelos comandos)
         cfg.banca = memory.get_banca(cfg.banca)
+        mode = get_banca_mode(cfg.banca)
+        log.info("Modo: %s (R$ %.2f)" % (mode["nome"], cfg.banca))
+
+        # Modo silencioso ativo — pular alertas mas continuar scans
+        if memory.is_silent():
+            log.info("Modo silencioso ativo — pulando alertas")
+            return
+
+        # Relatorio semanal (domingo)
+        if memory.needs_weekly_report():
+            await send_weekly_report(cfg.telegram_token, cfg.telegram_chat_id, memory, cfg.gemini_api_key)
+            wr_key = "weekly-report-%s" % date.today().isoformat()
+            memory.record(wr_key, {"market_key":"weekly","league":"system","odds":1.0,"stake":0,"ev_pct":0})
 
         opps, diag = await scan(cfg)
-        min_ev     = memory.get_adaptive_min_ev(cfg.min_ev_pct)
-        mode       = get_banca_mode(cfg.banca)
-        log.info("Modo: %s (R$ %.2f)" % (mode["nome"], cfg.banca))
+        min_ev = memory.get_adaptive_min_ev(cfg.min_ev_pct)
 
         if cfg.debug_mode:
             await send_diagnostic(cfg.telegram_token, cfg.telegram_chat_id, diag, min_ev)
 
         if not opps:
-            log.info("Sem oportunidades EV+")
+            log.info("Sem oportunidades EV+ apos filtros de sanidade")
             return
 
         mode_filtered = filter_by_mode(opps, mode, cfg.banca)
-        filtered = [o for o in mode_filtered if o["ev_pct"] >= min_ev]
-        log.info("%d oportunidades apos filtro do modo %s" % (len(filtered), mode["nome"]))
+        filtered      = [o for o in mode_filtered if o["ev_pct"] >= min_ev]
+        log.info("%d oportunidades passaram todos os filtros" % len(filtered))
 
         if not filtered:
-            log.info("Nenhuma oportunidade passou o filtro do modo")
+            log.info("Nenhuma oportunidade valida hoje (modo %s, EV min %.1f%%)" % (mode["nome"], min_ev))
+            # Avisar o usuario por que nao ha entradas
+            msg_no_filter = ("🔍 Scan %s — %d jogos EV+ encontrados, nenhum passou os filtros do modo %s. "
+                             "Criterios: prob >= %.0f%%, odds %.1f-5.0, EV >= %.1f%%. Monitorando." % (
+                             datetime.now().strftime("%d/%m %H:%M"),
+                             len(opps), mode["nome"], mode["min_prob"]*100, mode["min_odds"], min_ev))
+            await tg_send(cfg.telegram_token, cfg.telegram_chat_id, msg_no_filter)
             return
 
+        # Enviar alertas individuais
         sent = 0
         max_ind = mode["max_apostas"]
         for opp in filtered[:max_ind]:
@@ -1283,22 +1560,24 @@ async def run_cycle(cfg: Config, memory: Memory):
             ok = await send_opportunity(cfg.telegram_token, cfg.telegram_chat_id, opp)
             if ok:
                 await asyncio.sleep(1)
-                await send_analysis(cfg.telegram_token, cfg.telegram_chat_id, opp)
+                if opp.get("ai_analysis"):
+                    await send_analysis(cfg.telegram_token, cfg.telegram_chat_id, opp)
                 memory.record(key, opp)
                 sent += 1
                 await asyncio.sleep(2)
         log.info("%d alertas individuais enviados" % sent)
 
+        # Estrategia do dia (1x por dia)
         strategy_key = "strategy-%s" % date.today().isoformat()
         if not memory.already_sent_today(strategy_key):
-            log.info("Avaliando estrategia (modo %s)..." % mode["nome"])
+            log.info("Montando estrategia do dia (modo %s)..." % mode["nome"])
             strat = assess_day(filtered, cfg.banca, min_ev)
             await asyncio.sleep(3)
             await send_strategy(cfg.telegram_token, cfg.telegram_chat_id,
                                 strat, cfg.banca, cfg.gemini_api_key)
             memory.record(strategy_key, {
-                "market_key": "strategy", "league": "system",
-                "odds": 1.0, "stake": 0, "ev_pct": 0,
+                "market_key":"strategy","league":"system","odds":1.0,"stake":0,"ev_pct":0,
+                "home_team":"","away_team":""
             })
             log.info("Estrategia enviada: %s" % strat["rec"])
 
