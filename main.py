@@ -104,12 +104,47 @@ def calc_kelly(prob, odds, frac=0.25):
     b = odds - 1
     return max(0.0, ((b * prob - (1 - prob)) / b) * frac) if b > 0 else 0.0
 
+# ── SCORE COMPOSTO ───────────────────────────────────────────────────────────
+# Equilibra EV (valor matematico) com probabilidade (confianca) e edge
+# Score = EV*35% + Prob*35% + Edge*20% + Kelly*10%
+# Assim uma entrada com EV=8% e prob=65% bate uma com EV=14% e prob=35%
+
+def composite_score(ev_pct, prob, edge_pct, kelly_frac):
+    # Normalizar cada componente para 0-100
+    ev_norm    = min(ev_pct / 20.0, 1.0) * 100      # cap em 20% EV
+    prob_norm  = prob * 100                           # ja em 0-100
+    edge_norm  = min(edge_pct / 15.0, 1.0) * 100     # cap em 15% edge
+    kelly_norm = min(kelly_frac / 0.25, 1.0) * 100   # cap em 25% kelly
+    return round(ev_norm*0.35 + prob_norm*0.35 + edge_norm*0.20 + kelly_norm*0.10, 1)
+
+
+def classify_opportunity(ev, edge, prob, score):
+    # PREMIUM: alto EV E alta probabilidade — melhor dos mundos
+    if ev > 0.06 and prob >= 0.55 and edge > 3:
+        return "PREMIUM",  "🏆", "Alta prob + bom valor"
+    # VALOR: EV alto mas prob moderada — apostar menos
+    if ev > 0.06 and edge > 3:
+        return "VALOR",    "🔵", "Bom valor, prob moderada"
+    # SEGURO: prob alta, EV razoavel — entrada confiavel
+    if prob >= 0.58 and ev > 0.02:
+        return "SEGURO",   "🟢", "Alta probabilidade"
+    # EQUILIBRADO: bom score geral sem se destacar em nenhum
+    if score >= 55 and ev > 0.02:
+        return "EQUILIBRADO", "🟡", "Score equilibrado"
+    # MARGINAL: EV positivo mas fraco
+    if ev > 0.01:
+        return "MARGINAL", "🟠", "Valor marginal"
+    return "EVITAR",   "🔴", "Sem vantagem"
+
+
 def classify(ev, edge):
+    # Mantida para compatibilidade
     if ev > 0.12 and edge > 5: return "ALTO VALOR",     "🟢"
     if ev > 0.06 and edge > 2: return "BOM VALOR",      "🔵"
     if ev > 0.01 and edge > 0: return "VALOR MARGINAL", "🟡"
     if ev >= 0:                 return "SEM VANTAGEM",   "🟠"
     return "EVITAR", "🔴"
+
 
 MARKET_LABELS = {
     "home":"Vitória Casa","draw":"Empate","away":"Vitória Fora",
@@ -357,20 +392,44 @@ SPORT_KEYS = {
 }
 
 def fetch_odds(api_key: str, sport_key: str) -> List[Dict]:
-    """Busca odds via The Odds API — 500 req/mês grátis."""
-    url  = (f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-            f"?apiKey={api_key}&regions=eu&markets=h2h,totals"
-            f"&oddsFormat=decimal&dateFormat=iso")
+    """
+    Busca odds via The Odds API incluindo Handicap Asiatico.
+    Mercados: h2h (1X2), totals (over/under), btts, asian_handicap
+    """
+    # Buscar h2h + totals + btts em uma chamada
+    url = (
+        "https://api.the-odds-api.com/v4/sports/%s/odds"
+        "?apiKey=%s&regions=eu&markets=h2h,totals,btts"
+        "&oddsFormat=decimal&dateFormat=iso"
+    ) % (sport_key, api_key)
     data = http_get(url)
     if not data or not isinstance(data, list):
         return []
 
+    # Buscar handicap asiatico em chamada separada (mercado separado na API)
+    url_ah = (
+        "https://api.the-odds-api.com/v4/sports/%s/odds"
+        "?apiKey=%s&regions=eu&markets=asian_handicap"
+        "&oddsFormat=decimal&dateFormat=iso"
+    ) % (sport_key, api_key)
+    data_ah = http_get(url_ah) or []
+    # Indexar AH por chave home+away
+    ah_index = {}
+    for g in data_ah:
+        key = (g.get("home_team",""), g.get("away_team",""))
+        ah_index[key] = g
+
     result = []
     for game in data:
-        home = game.get("home_team","")
-        away = game.get("away_team","")
-        odds = {"home": None, "draw": None, "away": None,
-                "over25": None, "under25": None}
+        home = game.get("home_team", "")
+        away = game.get("away_team", "")
+        odds = {
+            "home": None, "draw": None, "away": None,
+            "over25": None, "under25": None, "btts": None,
+            "ah_home_0": None, "ah_away_0": None,    # AH 0 (empate sem aposta)
+            "ah_home_m5": None, "ah_away_m5": None,  # AH -0.5 (casa vence)
+            "ah_home_p5": None, "ah_away_p5": None,  # AH +0.5 (fora ou empate)
+        }
 
         for bm in game.get("bookmakers", [])[:3]:
             for mkt in bm.get("markets", []):
@@ -390,10 +449,42 @@ def fetch_odds(api_key: str, sport_key: str) -> List[Dict]:
                                 odds["over25"] = o["price"]
                             elif o["name"] == "Under" and not odds["under25"]:
                                 odds["under25"] = o["price"]
+                elif mkt["key"] == "btts":
+                    for o in mkt.get("outcomes", []):
+                        if o["name"] == "Yes" and not odds["btts"]:
+                            odds["btts"] = o["price"]
+
+        # Processar AH
+        ah_game = ah_index.get((home, away))
+        if ah_game:
+            for bm in ah_game.get("bookmakers", [])[:2]:
+                for mkt in bm.get("markets", []):
+                    if mkt["key"] == "asian_handicap":
+                        for o in mkt.get("outcomes", []):
+                            pt = o.get("point", 999)
+                            name = o.get("name", "")
+                            # AH 0 (draw no bet)
+                            if abs(pt) < 0.01:
+                                if name == home and not odds["ah_home_0"]:
+                                    odds["ah_home_0"] = o["price"]
+                                elif name == away and not odds["ah_away_0"]:
+                                    odds["ah_away_0"] = o["price"]
+                            # AH -0.5 casa (vence jogo)
+                            elif abs(pt - (-0.5)) < 0.01 and name == home and not odds["ah_home_m5"]:
+                                odds["ah_home_m5"] = o["price"]
+                            # AH +0.5 casa (nao perde)
+                            elif abs(pt - 0.5) < 0.01 and name == home and not odds["ah_home_p5"]:
+                                odds["ah_home_p5"] = o["price"]
+                            # AH +0.5 fora (nao perde)
+                            elif abs(pt - 0.5) < 0.01 and name == away and not odds["ah_away_p5"]:
+                                odds["ah_away_p5"] = o["price"]
+                            # AH -0.5 fora (vence jogo)
+                            elif abs(pt - (-0.5)) < 0.01 and name == away and not odds["ah_away_m5"]:
+                                odds["ah_away_m5"] = o["price"]
 
         result.append({"home": home, "away": away, "odds": odds})
 
-    log.info(f"  {sport_key}: {len(result)} jogos com odds")
+    log.info("  %s: %d jogos com odds" % (sport_key, len(result)))
     return result
 
 def match_odds(match_name_home: str, match_name_away: str,
