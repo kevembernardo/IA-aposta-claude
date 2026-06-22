@@ -1,9 +1,13 @@
 """
-BETTING AI ENGINE — Sistema Autônomo 24/7
+BETTING AI ENGINE — FAVORITOS DE ALTA PROBABILIDADE
+Estrutura simplificada: busca entradas com odd proxima de 1.50
+e alta probabilidade de acerto, em qualquer liga configurada.
+
 Stack 100% gratuita:
-  - football-data.org  → partidas e estatísticas (grátis)
-  - The Odds API       → odds reais (500 req/mês grátis)
-  - Google Gemini      → análise qualitativa (grátis, sem search)
+  - football-data.org  -> partidas e estatisticas
+  - The Odds API       -> odds reais (h2h, totals, btts, handicap asiatico)
+  - Google Gemini      -> analise qualitativa
+  - Telegram           -> alertas
 """
 
 import asyncio
@@ -40,1342 +44,605 @@ log = logging.getLogger(__name__)
 
 _executor = ThreadPoolExecutor(max_workers=3)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURAÇÃO
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ============================================================================
+# CONFIGURACAO
+# ============================================================================
 class Config:
     def __init__(self):
-        self.gemini_api_key       = os.getenv("GEMINI_API_KEY", "")
-        self.football_data_key    = os.getenv("FOOTBALL_DATA_KEY", "")
-        self.odds_api_key         = os.getenv("ODDS_API_KEY", "")
-        self.telegram_token       = os.getenv("TELEGRAM_TOKEN", "")
-        self.telegram_chat_id     = os.getenv("TELEGRAM_CHAT_ID", "")
-        self.banca                = float(os.getenv("BANCA", "1000"))
-        self.stop_loss_pct        = float(os.getenv("STOP_LOSS_PCT", "5"))
-        self.kelly_fraction       = float(os.getenv("KELLY_FRACTION", "0.25"))
-        self.min_ev_pct           = float(os.getenv("MIN_EV_PCT", "1"))
-        self.scan_interval_min    = int(os.getenv("SCAN_INTERVAL_MIN", "180"))
-        self.debug_mode           = os.getenv("DEBUG_MODE", "true").lower() == "true"
-        # IDs das ligas no football-data.org:
-        # PL=Premier, PD=La Liga, SA=Serie A, BL1=Bundesliga, FL1=Ligue1
-        # BSA=Brasileirao, BSB=Serie B, CPB=Copa Brasil
-        # CL=Champions, EL=Europa League, ECL=Conference League
-        # CLI=Libertadores, CSA=Sul-Americana
-        # DED=Eredivisie, PPL=Liga Portugal, TUR=Super Lig
-        # WC=Copa do Mundo, EC=Eurocopa, NL=Nations League
-        # MLS=MLS, APD=Argentina, MXN=Liga MX
-        self.league_ids           = os.getenv("LEAGUE_IDS", "PL,PD,SA,BL1,FL1,BSA,CL,EL,CLI,CSA").split(",")
+        self.gemini_api_key    = os.getenv("GEMINI_API_KEY", "")
+        self.football_data_key = os.getenv("FOOTBALL_DATA_KEY", "")
+        self.odds_api_key      = os.getenv("ODDS_API_KEY", "")
+        self.telegram_token    = os.getenv("TELEGRAM_TOKEN", "")
+        self.telegram_chat_id  = os.getenv("TELEGRAM_CHAT_ID", "")
+
+        self.banca             = float(os.getenv("BANCA", "1000"))
+        self.kelly_fraction    = float(os.getenv("KELLY_FRACTION", "0.15"))
+        self.stake_cap_pct     = float(os.getenv("STAKE_CAP_PCT", "5"))      # % max da banca por entrada
+
+        # Alvo de odd ~1.50
+        self.odd_min           = float(os.getenv("ODD_MIN", "1.35"))
+        self.odd_max           = float(os.getenv("ODD_MAX", "1.65"))
+        self.min_prob          = float(os.getenv("MIN_PROB", "0.68"))        # 68%+ de confianca
+        self.max_entries       = int(os.getenv("MAX_ENTRIES", "5"))          # entradas por scan
+
+        self.scan_interval_min = int(os.getenv("SCAN_INTERVAL_MIN", "120"))
+        self.debug_mode        = os.getenv("DEBUG_MODE", "true").lower() == "true"
+
+        self.league_ids        = os.getenv(
+            "LEAGUE_IDS",
+            "PL,PD,SA,BL1,FL1,DED,PPL,ELC,SPL,TUR,BEL,SUI,AUT,GRE,POL,DEN,NOR,SWE,"
+            "BSA,BSB,CLI,CSA,MLS,APD,MXN,COL,CHI,JPL,KOR,CSL,AUS,WC,EC,CL,EL"
+        ).split(",")
 
     def validate(self):
         errors = []
-        if not self.telegram_token:    errors.append("TELEGRAM_TOKEN não definida")
-        if not self.telegram_chat_id:  errors.append("TELEGRAM_CHAT_ID não definida")
-        if not self.football_data_key: errors.append("FOOTBALL_DATA_KEY não definida")
-        if not self.odds_api_key:      errors.append("ODDS_API_KEY não definida")
+        if not self.telegram_token:    errors.append("TELEGRAM_TOKEN nao definida")
+        if not self.telegram_chat_id:  errors.append("TELEGRAM_CHAT_ID nao definida")
+        if not self.football_data_key: errors.append("FOOTBALL_DATA_KEY nao definida")
+        if not self.odds_api_key:      errors.append("ODDS_API_KEY nao definida")
         if errors:
-            raise ValueError("Configuração inválida:\n" + "\n".join(f"  • {e}" for e in errors))
+            raise ValueError("Configuracao invalida:\n" + "\n".join("  - %s" % e for e in errors))
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MOTOR MATEMÁTICO — POISSON + KELLY + EV
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ============================================================================
+# MOTOR MATEMATICO — POISSON + EV + KELLY
+# ============================================================================
 def poisson_prob(lam: float, k: int) -> float:
     if lam <= 0: return 1.0 if k == 0 else 0.0
     log_p = -lam + k * math.log(lam)
     for i in range(1, k + 1): log_p -= math.log(i)
     return math.exp(log_p)
 
-def match_probs(lh: float, la: float, max_g: int = 8) -> Dict:
-    home = draw = away = over25 = btts = 0.0
+
+def match_probs(lh: float, la: float, max_g: int = 8, h1_ratio: float = 0.42) -> Dict:
+    """
+    Calcula probabilidades de TODOS os mercados a partir da distribuicao de Poisson:
+      - Resultado (home/draw/away)
+      - Over/Under em varias linhas: 0.5, 1.5, 2.5, 3.5
+      - Ambas marcam
+      - Handicap asiatico (+-0.5)
+      - Over/Under no PRIMEIRO TEMPO (0.5 e 1.5), estimado como uma fracao
+        dos gols esperados do jogo todo (h1_ratio ~42% e a media historica
+        de gols que acontecem na primeira etapa nas principais ligas).
+    """
+    home = draw = away = btts = 0.0
+    over_lines = {0.5: 0.0, 1.5: 0.0, 2.5: 0.0, 3.5: 0.0}
+
     for h in range(max_g + 1):
         ph = poisson_prob(lh, h)
         for a in range(max_g + 1):
             p = ph * poisson_prob(la, a)
-            if h > a:           home   += p
-            elif h == a:        draw   += p
-            else:               away   += p
-            if h + a > 2.5:     over25 += p
-            if h > 0 and a > 0: btts   += p
-    return {"home": home, "draw": draw, "away": away,
-            "over25": over25, "under25": 1 - over25, "btts": btts}
+            total = h + a
+            if h > a:           home += p
+            elif h == a:        draw += p
+            else:               away += p
+            if h > 0 and a > 0: btts += p
+            for line in over_lines:
+                if total > line:
+                    over_lines[line] += p
+
+    result = {
+        "home": home, "draw": draw, "away": away, "btts": btts,
+        "ah_home_m5": home,        "ah_home_p5": home + draw,
+        "ah_away_m5": away,        "ah_away_p5": away + draw,
+    }
+    for line, p_over in over_lines.items():
+        key = str(line).replace(".", "")  # 0.5 -> "05", 2.5 -> "25"
+        result["over%s" % key]  = p_over
+        result["under%s" % key] = 1 - p_over
+
+    # Primeiro tempo — total de gols esperado e uma fracao do jogo inteiro
+    lambda_h1_total = (lh + la) * h1_ratio
+    over_h1 = {0.5: 0.0, 1.5: 0.0}
+    max_h1 = 6
+    for t in range(max_h1 + 1):
+        p = poisson_prob(lambda_h1_total, t)
+        for line in over_h1:
+            if t > line:
+                over_h1[line] += p
+    for line, p_over in over_h1.items():
+        key = str(line).replace(".", "")
+        result["h1_over%s" % key]  = p_over
+        result["h1_under%s" % key] = 1 - p_over
+
+    return result
+
 
 def calc_ev(prob, odds):   return prob * (odds - 1) - (1 - prob)
 def calc_edge(prob, odds): return (prob - 1 / odds) * 100
-def calc_kelly(prob, odds, frac=0.25):
+
+
+def calc_kelly(prob, odds, frac=0.15):
     b = odds - 1
-    return max(0.0, ((b * prob - (1 - prob)) / b) * frac) if b > 0 else 0.0
-
-# ── SCORE COMPOSTO ───────────────────────────────────────────────────────────
-# Equilibra EV (valor matematico) com probabilidade (confianca) e edge
-# Score = EV*35% + Prob*35% + Edge*20% + Kelly*10%
-# Assim uma entrada com EV=8% e prob=65% bate uma com EV=14% e prob=35%
-
-def composite_score(ev_pct, prob, edge_pct, kelly_frac):
-    # Normalizar cada componente para 0-100
-    ev_norm    = min(ev_pct / 20.0, 1.0) * 100      # cap em 20% EV
-    prob_norm  = prob * 100                           # ja em 0-100
-    edge_norm  = min(edge_pct / 15.0, 1.0) * 100     # cap em 15% edge
-    kelly_norm = min(kelly_frac / 0.25, 1.0) * 100   # cap em 25% kelly
-    return round(ev_norm*0.35 + prob_norm*0.35 + edge_norm*0.20 + kelly_norm*0.10, 1)
-
-
-def classify_opportunity(ev, edge, prob, score):
-    # PREMIUM: alto EV E alta probabilidade — melhor dos mundos
-    if ev > 0.06 and prob >= 0.55 and edge > 3:
-        return "PREMIUM",  "🏆", "Alta prob + bom valor"
-    # VALOR: EV alto mas prob moderada — apostar menos
-    if ev > 0.06 and edge > 3:
-        return "VALOR",    "🔵", "Bom valor, prob moderada"
-    # SEGURO: prob alta, EV razoavel — entrada confiavel
-    if prob >= 0.58 and ev > 0.02:
-        return "SEGURO",   "🟢", "Alta probabilidade"
-    # EQUILIBRADO: bom score geral sem se destacar em nenhum
-    if score >= 55 and ev > 0.02:
-        return "EQUILIBRADO", "🟡", "Score equilibrado"
-    # MARGINAL: EV positivo mas fraco
-    if ev > 0.01:
-        return "MARGINAL", "🟠", "Valor marginal"
-    return "EVITAR",   "🔴", "Sem vantagem"
-
-
-def classify(ev, edge):
-    # Mantida para compatibilidade
-    if ev > 0.12 and edge > 5: return "ALTO VALOR",     "🟢"
-    if ev > 0.06 and edge > 2: return "BOM VALOR",      "🔵"
-    if ev > 0.01 and edge > 0: return "VALOR MARGINAL", "🟡"
-    if ev >= 0:                 return "SEM VANTAGEM",   "🟠"
-    return "EVITAR", "🔴"
+    if b <= 0: return 0.0
+    k = (b * prob - (1 - prob)) / b
+    return max(0.0, k * frac)
 
 
 MARKET_LABELS = {
-    "home":"Vitória Casa","draw":"Empate","away":"Vitória Fora",
-    "over25":"Over 2.5","under25":"Under 2.5","btts":"Ambas Marcam",
+    "home": "Vitoria Casa", "draw": "Empate", "away": "Vitoria Fora",
+    "over05": "Over 0.5", "under05": "Under 0.5",
+    "over15": "Over 1.5", "under15": "Under 1.5",
+    "over25": "Over 2.5", "under25": "Under 2.5",
+    "over35": "Over 3.5", "under35": "Under 3.5",
+    "h1_over05": "Over 0.5 (1T)", "h1_under05": "Under 0.5 (1T)",
+    "h1_over15": "Over 1.5 (1T)", "h1_under15": "Under 1.5 (1T)",
+    "btts": "Ambas Marcam",
+    "ah_home_m5": "Handicap Asiatico Casa -0.5", "ah_home_p5": "Handicap Asiatico Casa +0.5",
+    "ah_away_m5": "Handicap Asiatico Fora -0.5", "ah_away_p5": "Handicap Asiatico Fora +0.5",
 }
+
 BETANO_PATH = {
-    "home":    ("Principais","Resultado Final","1 — Vitória Casa"),
-    "draw":    ("Principais","Resultado Final","X — Empate"),
-    "away":    ("Principais","Resultado Final","2 — Vitória Visitante"),
-    "over25":  ("Gols","Total de Gols","Mais de 2.5"),
-    "under25": ("Gols","Total de Gols","Menos de 2.5"),
-    "btts":    ("Gols","Ambas Equipes Marcam","Sim"),
+    "home":       ("Principais", "Resultado Final", "1 - Vitoria Casa"),
+    "draw":       ("Principais", "Resultado Final", "X - Empate"),
+    "away":       ("Principais", "Resultado Final", "2 - Vitoria Visitante"),
+    "over05":     ("Gols", "Total de Gols", "Mais de 0.5"),
+    "under05":    ("Gols", "Total de Gols", "Menos de 0.5"),
+    "over15":     ("Gols", "Total de Gols", "Mais de 1.5"),
+    "under15":    ("Gols", "Total de Gols", "Menos de 1.5"),
+    "over25":     ("Gols", "Total de Gols", "Mais de 2.5"),
+    "under25":    ("Gols", "Total de Gols", "Menos de 2.5"),
+    "over35":     ("Gols", "Total de Gols", "Mais de 3.5"),
+    "under35":    ("Gols", "Total de Gols", "Menos de 3.5"),
+    "h1_over05":  ("1o Tempo", "Total de Gols 1o Tempo", "Mais de 0.5"),
+    "h1_under05": ("1o Tempo", "Total de Gols 1o Tempo", "Menos de 0.5"),
+    "h1_over15":  ("1o Tempo", "Total de Gols 1o Tempo", "Mais de 1.5"),
+    "h1_under15": ("1o Tempo", "Total de Gols 1o Tempo", "Menos de 1.5"),
+    "btts":       ("Gols", "Ambas Equipes Marcam", "Sim"),
+    "ah_home_m5": ("Handicap", "Handicap Asiatico", "Casa -0.5"),
+    "ah_home_p5": ("Handicap", "Handicap Asiatico", "Casa +0.5"),
+    "ah_away_m5": ("Handicap", "Handicap Asiatico", "Fora -0.5"),
+    "ah_away_p5": ("Handicap", "Handicap Asiatico", "Fora +0.5"),
 }
 
-def analyze_markets(home_avg_scored, home_avg_conceded,
-                    away_avg_scored, away_avg_conceded,
-                    odds: Dict, banca: float, kfrac: float,
-                    has_real_data: bool = False) -> List[Dict]:
-    lh    = home_avg_scored * away_avg_conceded
-    la    = away_avg_scored * home_avg_conceded
+
+def find_favorite_markets(home_attack, home_defense, away_attack, away_defense,
+                           odds: Dict, cfg: Config) -> List[Dict]:
+    """
+    Varre TODOS os mercados do jogo e retorna apenas os que tem
+    odd dentro da faixa alvo (~1.50) E alta probabilidade real.
+    Nao filtra por EV — o criterio e exclusivamente odd + confianca.
+    """
+    lh = home_attack * away_defense
+    la = away_attack * home_defense
     probs = match_probs(lh, la)
+
     results = []
-
-    # Com dados reais do time permite odds ate 5.00
-    # Com medias de liga limita a 3.50 (modelos genericos nao sao confiaveis em azaraos)
-    max_odds_allowed = 5.00 if has_real_data else 3.50
-
     for key, prob in probs.items():
         o = odds.get(key)
-        if not o or o <= 1.01: continue
+        if not o or o <= 1.01:
+            continue
 
-        # Cap de odds por qualidade dos dados
-        if o > max_odds_allowed: continue
+        # Filtro 1: odd precisa estar na faixa alvo (~1.50)
+        if not (cfg.odd_min <= o <= cfg.odd_max):
+            continue
 
-        # Probabilidade minima — abaixo de 25% o modelo nao e confiavel
-        if prob < 0.25: continue
-
-        implied = 1.0 / o
-
-        # Divergencia excessiva: se o mercado ve < 30% e nosso modelo ve > 65%
-        # isso e sinal de dado ruim, nao de value bet
-        if implied < 0.30 and prob > 0.60: continue
+        # Filtro 2: probabilidade real precisa ser alta
+        if prob < cfg.min_prob:
+            continue
 
         ev   = calc_ev(prob, o)
         edge = calc_edge(prob, o)
+        kf   = calc_kelly(prob, o, cfg.kelly_fraction)
+        stake = cfg.banca * kf
+        stake = min(stake, cfg.banca * cfg.stake_cap_pct / 100.0)
+        stake = max(1.0, round(stake, 2))
 
-        # Rejeitar EV negativo direto
-        if ev <= 0: continue
+        # Distancia ao alvo 1.50 — usado para desempate no ranking
+        dist_to_target = abs(o - 1.50)
 
-        # Cap de EV realista:
-        # Com dados reais: max 20% (markets eficientes raramente dao mais)
-        # Com medias de liga: max 15%
-        ev_max = 0.20 if has_real_data else 0.15
-        if ev > ev_max: continue
-
-        kf   = calc_kelly(prob, o, kfrac)
-        lbl, emoji = classify(ev, edge)
         results.append({
-            "key":key,"label":MARKET_LABELS.get(key,key),
-            "prob":prob,"implied":implied,"odds":o,
-            "ev":ev,"ev_pct":ev*100,"edge_pct":edge,
-            "kelly":kf,"stake":banca*kf,
-            "cls_label":lbl,"cls_color":emoji,
+            "key": key, "label": MARKET_LABELS.get(key, key),
+            "prob": prob, "implied": 1.0 / o, "odds": o,
+            "ev": ev, "ev_pct": ev * 100, "edge_pct": edge,
+            "kelly": kf, "stake": stake,
+            "dist_to_target": dist_to_target,
         })
-    return sorted(results, key=lambda x: x["ev_pct"], reverse=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HTTP HELPER — urllib stdlib
-# ═══════════════════════════════════════════════════════════════════════════════
+    # Ranking: maior probabilidade primeiro, depois menor distancia da odd alvo
+    results.sort(key=lambda x: (-x["prob"], x["dist_to_target"]))
+    return results
+
+
+# ============================================================================
+# HTTP HELPER
+# ============================================================================
 def http_get(url: str, headers: Dict = None) -> Optional[Dict]:
     req = urllib.request.Request(url, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        log.error(f"HTTP {e.code} em {url}: {e.read().decode()[:200]}")
+        log.error("HTTP %d em %s: %s" % (e.code, url, e.read().decode()[:200]))
         return None
     except Exception as e:
-        log.error(f"Erro em {url}: {e}")
+        log.error("Erro em %s: %s" % (url, e))
         return None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FOOTBALL-DATA.ORG — partidas e estatísticas
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ============================================================================
+# FOOTBALL-DATA.ORG — partidas e times
+# ============================================================================
 LEAGUE_NAMES = {
-    # Europa — Ligas nacionais
-    "PL":   "Premier League",
-    "PD":   "La Liga",
-    "SA":   "Serie A",
-    "BL1":  "Bundesliga",
-    "FL1":  "Ligue 1",
-    "DED":  "Eredivisie",
-    "PPL":  "Liga Portugal",
-    "PD2":  "Segunda Divisao Espanha",
-    "ELC":  "Championship (Ing)",
-    "SPL":  "Scottish Premiership",
-    "TUR":  "Super Lig Turquia",
-    # Europa — Copas
-    "CL":   "Champions League",
-    "EL":   "Europa League",
-    "ECL":  "Conference League",
-    "EC":   "Eurocopa",
-    "NL":   "Nations League",
-    "WC":   "Copa do Mundo",
-    # Americas
-    "BSA":  "Brasileirao Serie A",
-    "BSB":  "Brasileirao Serie B",
-    "CPB":  "Copa do Brasil",
-    "CLI":  "Libertadores",
-    "CSA":  "Sul-Americana",
-    "MLS":  "MLS",
-    "APD":  "Argentina Primera",
-    "MXN":  "Liga MX",
-    "COL":  "Liga Colombia",
-    "CHI":  "Primera Chile",
-    "URU":  "Primera Uruguay",
-    # Asia / Outros
-    "JPL":  "J-League",
-    "CSL":  "Chinese Super League",
+    "PL": "Premier League", "PD": "La Liga", "SA": "Serie A",
+    "BL1": "Bundesliga", "FL1": "Ligue 1", "DED": "Eredivisie",
+    "PPL": "Liga Portugal", "ELC": "Championship", "SPL": "Scottish Premiership",
+    "TUR": "Super Lig Turquia",
+    "BEL": "Belgica - First Div A", "SUI": "Suica - Super League",
+    "AUT": "Austria - Bundesliga", "GRE": "Grecia - Super League",
+    "POL": "Polonia - Ekstraklasa", "DEN": "Dinamarca - Superliga",
+    "NOR": "Noruega - Eliteserien", "SWE": "Suecia - Allsvenskan",
+    "CL": "Champions League", "EL": "Europa League", "ECL": "Conference League",
+    "EC": "Eurocopa", "NL": "Nations League", "WC": "Copa do Mundo",
+    "BSA": "Brasileirao Serie A", "BSB": "Brasileirao Serie B", "CPB": "Copa do Brasil",
+    "CLI": "Libertadores", "CSA": "Sul-Americana",
+    "MLS": "MLS", "APD": "Argentina Primera", "MXN": "Liga MX", "COL": "Liga Colombia",
+    "CHI": "Primera Chile", "URU": "Primera Uruguay",
+    "JPL": "J-League", "KOR": "K League 1", "CSL": "Chinese Super League",
+    "AUS": "A-League Australia",
 }
 
-def fetch_matches_with_ids(api_key: str, league_ids: List[str]) -> List[Dict]:
-    """Busca partidas das próximas 48h via football-data.org."""
-    today    = date.today()
-    in_3_days = today + timedelta(days=2)
-    date_from = today.strftime("%Y-%m-%d")
-    date_to   = in_3_days.strftime("%Y-%m-%d")
+LEAGUE_AVGS = {
+    # liga: (media_gols_marcados, media_gols_sofridos)
+    "PL": (1.45, 1.10), "PD": (1.35, 1.00), "SA": (1.30, 1.00),
+    "BL1": (1.55, 1.15), "FL1": (1.25, 0.95), "DED": (1.55, 1.20),
+    "PPL": (1.35, 1.05), "ELC": (1.40, 1.10), "SPL": (1.50, 1.15), "TUR": (1.45, 1.15),
+    "BEL": (1.50, 1.15), "SUI": (1.50, 1.15), "AUT": (1.55, 1.20),
+    "GRE": (1.30, 1.00), "POL": (1.30, 1.05), "DEN": (1.45, 1.15),
+    "NOR": (1.45, 1.15), "SWE": (1.40, 1.10),
+    "CL": (1.50, 1.10), "EL": (1.45, 1.10), "ECL": (1.40, 1.05),
+    "EC": (1.25, 0.95), "NL": (1.30, 1.00), "WC": (1.20, 0.90),
+    "BSA": (1.40, 1.05), "BSB": (1.35, 1.05), "CPB": (1.30, 1.00),
+    "CLI": (1.35, 1.00), "CSA": (1.30, 1.00), "MLS": (1.50, 1.15),
+    "APD": (1.45, 1.10), "MXN": (1.40, 1.05), "COL": (1.35, 1.05),
+    "CHI": (1.30, 1.00), "URU": (1.35, 1.05), "JPL": (1.35, 1.00),
+    "KOR": (1.35, 1.05), "CSL": (1.40, 1.05), "AUS": (1.45, 1.15),
+}
 
-    headers  = {"X-Auth-Token": api_key}
-    matches  = []
+SPORT_KEYS = {
+    "PL": "soccer_epl", "PD": "soccer_spain_la_liga", "SA": "soccer_italy_serie_a",
+    "BL1": "soccer_germany_bundesliga", "FL1": "soccer_france_ligue_one",
+    "DED": "soccer_netherlands_eredivisie", "PPL": "soccer_portugal_primeira_liga",
+    "ELC": "soccer_england_league1", "SPL": "soccer_scotland_premiership",
+    "TUR": "soccer_turkey_super_league",
+    "BEL": "soccer_belgium_first_div", "SUI": "soccer_switzerland_superleague",
+    "AUT": "soccer_austria_bundesliga", "GRE": "soccer_greece_super_league",
+    "POL": "soccer_poland_ekstraklasa", "DEN": "soccer_denmark_superliga",
+    "NOR": "soccer_norway_eliteserien", "SWE": "soccer_sweden_allsvenskan",
+    "CL": "soccer_uefa_champs_league", "EL": "soccer_uefa_europa_league",
+    "ECL": "soccer_uefa_europa_conference_league", "EC": "soccer_uefa_european_championship",
+    "NL": "soccer_uefa_nations_league", "WC": "soccer_fifa_world_cup",
+    "BSA": "soccer_brazil_campeonato", "BSB": "soccer_brazil_serie_b",
+    "CPB": "soccer_brazil_copa_do_brasil", "CLI": "soccer_conmebol_copa_libertadores",
+    "CSA": "soccer_conmebol_copa_sudamericana", "MLS": "soccer_usa_mls",
+    "APD": "soccer_argentina_primera_division", "MXN": "soccer_mexico_ligamx",
+    "COL": "soccer_colombia_primera_a", "CHI": "soccer_chile_campeonato",
+    "JPL": "soccer_japan_j_league", "KOR": "soccer_korea_kleague1",
+    "CSL": "soccer_china_superleague", "AUS": "soccer_australia_aleague",
+}
+
+
+def _iso_to_brt(iso_str: str) -> str:
+    try:
+        dt = datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%SZ") - timedelta(hours=3)
+        return dt.strftime("%d/%m %H:%M")
+    except Exception:
+        return iso_str[:16] if iso_str else "?"
+
+
+def fetch_matches(api_key: str, league_ids: List[str], days: int = 2) -> List[Dict]:
+    """Busca partidas dos proximos N dias em todas as ligas configuradas."""
+    today = date.today()
+    end   = today + timedelta(days=days)
+    headers = {"X-Auth-Token": api_key}
+    matches = []
 
     for lid in league_ids:
-        url  = (f"https://api.football-data.org/v4/competitions/{lid}/matches"
-                f"?dateFrom={date_from}&dateTo={date_to}&status=SCHEDULED")
+        lid = lid.strip()
+        if not lid:
+            continue
+        url = (
+            "https://api.football-data.org/v4/competitions/%s/matches"
+            "?dateFrom=%s&dateTo=%s&status=SCHEDULED"
+        ) % (lid, today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
         data = http_get(url, headers)
         if not data:
             continue
-        for m in data.get("matches", []):
-            home = m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name","?")
-            away = m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name","?")
-            utc  = m.get("utcDate","")
+        found = data.get("matches", [])
+        for m in found:
+            home = m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "?")
+            away = m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "?")
+            utc  = m.get("utcDate", "")
             try:
-                dt = datetime.strptime(utc, "%Y-%m-%dT%H:%M:%SZ")
-                # Converter para horário de Brasília (UTC-3)
-                dt_br = dt - timedelta(hours=3)
-                date_str = dt_br.strftime("%d/%m %H:%M")
+                dt = datetime.strptime(utc, "%Y-%m-%dT%H:%M:%SZ") - timedelta(hours=3)
+                date_str = dt.strftime("%d/%m %H:%M")
             except Exception:
                 date_str = utc[:16]
-
             matches.append({
-                "homeTeam":  home,
-                "awayTeam":  away,
-                "league":    LEAGUE_NAMES.get(lid, lid),
-                "league_id": lid,
-                "date":      date_str,
-                "id":        m.get("id"),
-                "home_id":   m.get("homeTeam", {}).get("id"),
-                "away_id":   m.get("awayTeam", {}).get("id"),
+                "homeTeam": home, "awayTeam": away,
+                "league": LEAGUE_NAMES.get(lid, lid), "league_id": lid,
+                "date": date_str,
+                "home_id": m.get("homeTeam", {}).get("id"),
+                "away_id": m.get("awayTeam", {}).get("id"),
             })
-        n_found = len(data.get("matches",[]))
-        log.info("  %s (%s): %d partidas" % (lid, LEAGUE_NAMES.get(lid,lid), n_found))
+        log.info("  %s (%s): %d partidas" % (lid, LEAGUE_NAMES.get(lid, lid), len(found)))
 
-    log.info(f"Total de partidas: {len(matches)}")
+    log.info("Total de partidas encontradas: %d" % len(matches))
     return matches
 
 
-def fetch_team_form(api_key, team_id, n=6):
-    url  = 'https://api.football-data.org/v4/teams/%d/matches?limit=%d&status=FINISHED' % (team_id, n)
-    data = http_get(url, {'X-Auth-Token': api_key})
-    if not data or not data.get('matches'):
-        return {'scored':1.3,'conceded':1.3,'form_score':0.5,
-                'home_scored':1.4,'home_conceded':1.2,
-                'away_scored':1.1,'away_conceded':1.4,'sample':0,'form_str':'-----'}
-    matches = data['matches']
-    scored_l=[]; conceded_l=[]; home_s=[]; home_c=[]; away_s=[]; away_c=[]; form_pts=[]
+def fetch_team_form(api_key: str, team_id: int, n: int = 6) -> Dict:
+    """Historico real do time com peso exponencial nos jogos recentes."""
+    url = "https://api.football-data.org/v4/teams/%d/matches?limit=%d&status=FINISHED" % (team_id, n)
+    data = http_get(url, {"X-Auth-Token": api_key})
+    empty = {"scored": 1.3, "conceded": 1.3, "form_score": 0.5,
+             "home_scored": 1.4, "home_conceded": 1.2,
+             "away_scored": 1.1, "away_conceded": 1.4, "sample": 0, "form_str": "-----"}
+    if not data or not data.get("matches"):
+        return empty
+
+    matches = data["matches"]
+    scored_l, conceded_l = [], []
+    home_s, home_c, away_s, away_c = [], [], [], []
+    form_pts = []
+
     for m in matches:
-        score = m.get('score',{}).get('fullTime',{})
-        hs = score.get('home',0) or 0
-        as_ = score.get('away',0) or 0
-        is_home = m.get('homeTeam',{}).get('id') == team_id
+        score = m.get("score", {}).get("fullTime", {})
+        hs = score.get("home", 0) or 0
+        as_ = score.get("away", 0) or 0
+        is_home = m.get("homeTeam", {}).get("id") == team_id
         s, c = (hs, as_) if is_home else (as_, hs)
         scored_l.append(s); conceded_l.append(c)
         (home_s if is_home else away_s).append(s)
         (home_c if is_home else away_c).append(c)
         form_pts.append(3 if s > c else (1 if s == c else 0))
+
     ng = len(scored_l)
     if ng == 0:
-        return {'scored':1.3,'conceded':1.3,'form_score':0.5,
-                'home_scored':1.4,'home_conceded':1.2,
-                'away_scored':1.1,'away_conceded':1.4,'sample':0,'form_str':'-----'}
-    # Peso exponencial — jogos recentes pesam mais (0.5^distancia)
-    ws = [0.5**(ng-1-i) for i in range(ng)]
+        return empty
+
+    ws = [0.5 ** (ng - 1 - i) for i in range(ng)]
+
     def wavg(lst, w):
         if not lst: return 0.0
-        w2=w[:len(lst)]; tw=sum(w2)
-        return sum(v*ww for v,ww in zip(lst,w2))/tw if tw>0 else sum(lst)/len(lst)
-    form_score = round(wavg(form_pts, ws)/3.0, 3)
+        w2 = w[:len(lst)]; tw = sum(w2)
+        return sum(v * ww for v, ww in zip(lst, w2)) / tw if tw > 0 else sum(lst) / len(lst)
+
     return {
-        'scored':        round(wavg(scored_l, ws), 3),
-        'conceded':      round(wavg(conceded_l, ws), 3),
-        'form_score':    form_score,
-        'home_scored':   round(sum(home_s)/max(1,len(home_s)), 3),
-        'home_conceded': round(sum(home_c)/max(1,len(home_c)), 3),
-        'away_scored':   round(sum(away_s)/max(1,len(away_s)), 3),
-        'away_conceded': round(sum(away_c)/max(1,len(away_c)), 3),
-        'sample':        ng,
-        'form_str':      ''.join('V' if p==3 else 'E' if p==1 else 'D' for p in form_pts[-5:]),
+        "scored": round(wavg(scored_l, ws), 3),
+        "conceded": round(wavg(conceded_l, ws), 3),
+        "form_score": round(wavg(form_pts, ws) / 3.0, 3),
+        "home_scored": round(sum(home_s) / max(1, len(home_s)), 3),
+        "home_conceded": round(sum(home_c) / max(1, len(home_c)), 3),
+        "away_scored": round(sum(away_s) / max(1, len(away_s)), 3),
+        "away_conceded": round(sum(away_c) / max(1, len(away_c)), 3),
+        "sample": ng,
+        "form_str": "".join("V" if p == 3 else "E" if p == 1 else "D" for p in form_pts[-5:]),
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# THE ODDS API — odds reais
-# ═══════════════════════════════════════════════════════════════════════════════
-SPORT_KEYS = {
-    # Europa — ligas
-    "PL":  "soccer_epl",
-    "PD":  "soccer_spain_la_liga",
-    "SA":  "soccer_italy_serie_a",
-    "BL1": "soccer_germany_bundesliga",
-    "FL1": "soccer_france_ligue_one",
-    "DED": "soccer_netherlands_eredivisie",
-    "PPL": "soccer_portugal_primeira_liga",
-    "ELC": "soccer_england_league1",
-    "SPL": "soccer_scotland_premiership",
-    "TUR": "soccer_turkey_super_league",
-    # Europa — copas
-    "CL":  "soccer_uefa_champs_league",
-    "EL":  "soccer_uefa_europa_league",
-    "ECL": "soccer_uefa_europa_conference_league",
-    "EC":  "soccer_uefa_european_championship",
-    "NL":  "soccer_uefa_nations_league",
-    "WC":  "soccer_fifa_world_cup",
-    # Americas
-    "BSA": "soccer_brazil_campeonato",
-    "BSB": "soccer_brazil_serie_b",
-    "CPB": "soccer_brazil_copa_do_brasil",
-    "CLI": "soccer_conmebol_copa_libertadores",
-    "CSA": "soccer_conmebol_copa_sudamericana",
-    "MLS": "soccer_usa_mls",
-    "APD": "soccer_argentina_primera_division",
-    "MXN": "soccer_mexico_ligamx",
-    "COL": "soccer_colombia_primera_a",
-    # Asia
-    "JPL": "soccer_japan_j_league",
-}
-
+# ============================================================================
+# THE ODDS API — odds reais incluindo handicap asiatico
+# ============================================================================
 def fetch_odds(api_key: str, sport_key: str) -> List[Dict]:
     """
-    Busca odds via The Odds API incluindo Handicap Asiatico.
-    Mercados: h2h (1X2), totals (over/under), btts, asian_handicap
+    Busca odds via The Odds API e calcula CONSENSO (mediana) entre todas
+    as casas retornadas. Mantem exatamente 2 chamadas por liga (mesma cota
+    de antes) mas agora captura:
+      - Varias linhas de Over/Under do jogo todo (0.5/1.5/2.5/3.5)
+      - Over/Under do PRIMEIRO TEMPO (0.5/1.5), quando a casa oferece
+    Cada linha retornada pelas casas e arredondada para a linha-alvo
+    mais proxima — nao usamos "alternate_totals" (custaria uma chamada
+    extra por liga e estouraria a cota gratuita de 500/mes).
     """
-    # Buscar h2h + totals + btts em uma chamada
+    import statistics
+
+    FT_LINES = [0.5, 1.5, 2.5, 3.5]
+    H1_LINES = [0.5, 1.5]
+
+    def nearest_line(pt, lines):
+        return min(lines, key=lambda l: abs(l - pt))
+
     url = (
         "https://api.the-odds-api.com/v4/sports/%s/odds"
-        "?apiKey=%s&regions=eu&markets=h2h,totals,btts"
+        "?apiKey=%s&regions=eu&markets=h2h,totals,btts,totals_h1"
         "&oddsFormat=decimal&dateFormat=iso"
     ) % (sport_key, api_key)
     data = http_get(url)
     if not data or not isinstance(data, list):
         return []
 
-    # Buscar handicap asiatico em chamada separada (mercado separado na API)
     url_ah = (
         "https://api.the-odds-api.com/v4/sports/%s/odds"
-        "?apiKey=%s&regions=eu&markets=asian_handicap"
+        "?apiKey=%s&regions=eu&markets=spreads"
         "&oddsFormat=decimal&dateFormat=iso"
     ) % (sport_key, api_key)
     data_ah = http_get(url_ah) or []
-    # Indexar AH por chave home+away
     ah_index = {}
-    for g in data_ah:
-        key = (g.get("home_team",""), g.get("away_team",""))
-        ah_index[key] = g
+    if isinstance(data_ah, list):
+        for g in data_ah:
+            ah_index[(g.get("home_team", ""), g.get("away_team", ""))] = g
+
+    def median(lst):
+        return round(statistics.median(lst), 3) if lst else None
 
     result = []
     for game in data:
         home = game.get("home_team", "")
         away = game.get("away_team", "")
-        odds = {
-            "home": None, "draw": None, "away": None,
-            "over25": None, "under25": None, "btts": None,
-            "ah_home_0": None, "ah_away_0": None,    # AH 0 (empate sem aposta)
-            "ah_home_m5": None, "ah_away_m5": None,  # AH -0.5 (casa vence)
-            "ah_home_p5": None, "ah_away_p5": None,  # AH +0.5 (fora ou empate)
-        }
 
-        for bm in game.get("bookmakers", [])[:3]:
+        buckets = {"home": [], "draw": [], "away": [], "btts": []}
+        for line in FT_LINES:
+            key = str(line).replace(".", "")
+            buckets["over%s" % key]  = []
+            buckets["under%s" % key] = []
+        for line in H1_LINES:
+            key = str(line).replace(".", "")
+            buckets["h1_over%s" % key]  = []
+            buckets["h1_under%s" % key] = []
+
+        for bm in game.get("bookmakers", [])[:8]:
             for mkt in bm.get("markets", []):
                 if mkt["key"] == "h2h":
                     for o in mkt.get("outcomes", []):
-                        if o["name"] == home and not odds["home"]:
-                            odds["home"] = o["price"]
-                        elif o["name"] == away and not odds["away"]:
-                            odds["away"] = o["price"]
-                        elif o["name"] == "Draw" and not odds["draw"]:
-                            odds["draw"] = o["price"]
+                        if o["name"] == home:
+                            buckets["home"].append(o["price"])
+                        elif o["name"] == away:
+                            buckets["away"].append(o["price"])
+                        elif o["name"] == "Draw":
+                            buckets["draw"].append(o["price"])
+
                 elif mkt["key"] == "totals":
                     for o in mkt.get("outcomes", []):
-                        pt = o.get("point", 0)
-                        if abs(pt - 2.5) < 0.1:
-                            if o["name"] == "Over" and not odds["over25"]:
-                                odds["over25"] = o["price"]
-                            elif o["name"] == "Under" and not odds["under25"]:
-                                odds["under25"] = o["price"]
+                        pt = o.get("point")
+                        if pt is None:
+                            continue
+                        line = nearest_line(pt, FT_LINES)
+                        lkey = str(line).replace(".", "")
+                        if o["name"] == "Over":
+                            buckets["over%s" % lkey].append(o["price"])
+                        elif o["name"] == "Under":
+                            buckets["under%s" % lkey].append(o["price"])
+
+                elif mkt["key"] == "totals_h1":
+                    for o in mkt.get("outcomes", []):
+                        pt = o.get("point")
+                        if pt is None:
+                            continue
+                        line = nearest_line(pt, H1_LINES)
+                        lkey = str(line).replace(".", "")
+                        if o["name"] == "Over":
+                            buckets["h1_over%s" % lkey].append(o["price"])
+                        elif o["name"] == "Under":
+                            buckets["h1_under%s" % lkey].append(o["price"])
+
                 elif mkt["key"] == "btts":
                     for o in mkt.get("outcomes", []):
-                        if o["name"] == "Yes" and not odds["btts"]:
-                            odds["btts"] = o["price"]
+                        if o["name"] == "Yes":
+                            buckets["btts"].append(o["price"])
 
-        # Processar AH
+        odds = {k: median(v) for k, v in buckets.items()}
+        odds.update({"ah_home_m5": None, "ah_home_p5": None,
+                      "ah_away_m5": None, "ah_away_p5": None})
+
+        ah_buckets = {"ah_home_m5": [], "ah_home_p5": [], "ah_away_m5": [], "ah_away_p5": []}
         ah_game = ah_index.get((home, away))
         if ah_game:
-            for bm in ah_game.get("bookmakers", [])[:2]:
+            for bm in ah_game.get("bookmakers", [])[:6]:
                 for mkt in bm.get("markets", []):
-                    if mkt["key"] == "asian_handicap":
-                        for o in mkt.get("outcomes", []):
-                            pt = o.get("point", 999)
-                            name = o.get("name", "")
-                            # AH 0 (draw no bet)
-                            if abs(pt) < 0.01:
-                                if name == home and not odds["ah_home_0"]:
-                                    odds["ah_home_0"] = o["price"]
-                                elif name == away and not odds["ah_away_0"]:
-                                    odds["ah_away_0"] = o["price"]
-                            # AH -0.5 casa (vence jogo)
-                            elif abs(pt - (-0.5)) < 0.01 and name == home and not odds["ah_home_m5"]:
-                                odds["ah_home_m5"] = o["price"]
-                            # AH +0.5 casa (nao perde)
-                            elif abs(pt - 0.5) < 0.01 and name == home and not odds["ah_home_p5"]:
-                                odds["ah_home_p5"] = o["price"]
-                            # AH +0.5 fora (nao perde)
-                            elif abs(pt - 0.5) < 0.01 and name == away and not odds["ah_away_p5"]:
-                                odds["ah_away_p5"] = o["price"]
-                            # AH -0.5 fora (vence jogo)
-                            elif abs(pt - (-0.5)) < 0.01 and name == away and not odds["ah_away_m5"]:
-                                odds["ah_away_m5"] = o["price"]
+                    if mkt["key"] != "spreads":
+                        continue
+                    for o in mkt.get("outcomes", []):
+                        pt = o.get("point", 999)
+                        name = o.get("name", "")
+                        if abs(pt - (-0.5)) < 0.01 and name == home:
+                            ah_buckets["ah_home_m5"].append(o["price"])
+                        elif abs(pt - 0.5) < 0.01 and name == home:
+                            ah_buckets["ah_home_p5"].append(o["price"])
+                        elif abs(pt - (-0.5)) < 0.01 and name == away:
+                            ah_buckets["ah_away_m5"].append(o["price"])
+                        elif abs(pt - 0.5) < 0.01 and name == away:
+                            ah_buckets["ah_away_p5"].append(o["price"])
+        for k, v in ah_buckets.items():
+            odds[k] = median(v)
 
-        result.append({"home": home, "away": away, "odds": odds})
+        result.append({
+            "home": home, "away": away, "odds": odds,
+            "n_bookmakers": len(game.get("bookmakers", [])),
+            "commence_time": game.get("commence_time", ""),
+        })
 
-    log.info("  %s: %d jogos com odds" % (sport_key, len(result)))
+    log.info("  %s: %d jogos com odds (consenso, multi-linha)" % (sport_key, len(result)))
     return result
 
-def match_odds(match_name_home: str, match_name_away: str,
-               odds_list: List[Dict]) -> Optional[Dict]:
-    """Casa as odds com o jogo pelo nome do time."""
-    def normalize(s):
-        import unicodedata
-        s = unicodedata.normalize("NFD", s.lower())
-        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-        return re.sub(r"[^a-z0-9]", "", s)
 
-    nh = normalize(match_name_home)
-    na = normalize(match_name_away)
+def normalize_name(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFD", (s or "").lower())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]", "", s)
 
+
+def names_match(name_a: str, name_b: str) -> int:
+    """Score de 0-5 indicando o quanto dois nomes de time se parecem."""
+    na, nb = normalize_name(name_a), normalize_name(name_b)
+    score = 0
+    if na in nb or nb in na: score += 3
+    if na[:4] == nb[:4]: score += 1
+    if na[:6] == nb[:6]: score += 1
+    return score
+
+
+def match_odds(home_name: str, away_name: str, odds_list: List[Dict]) -> Optional[Dict]:
+    nh, na = normalize_name(home_name), normalize_name(away_name)
     best, best_score = None, 0
     for o in odds_list:
-        oh = normalize(o["home"])
-        oa = normalize(o["away"])
-        # Match exato ou parcial
+        oh, oa = normalize_name(o["home"]), normalize_name(o["away"])
         score = 0
         if nh in oh or oh in nh: score += 2
         if na in oa or oa in na: score += 2
         if nh[:4] in oh: score += 1
         if na[:4] in oa: score += 1
         if score > best_score:
-            best_score = score
-            best = o
-
+            best_score, best = score, o
     return best["odds"] if best and best_score >= 3 else None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GEMINI — análise qualitativa (sem search, gratuito)
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ============================================================================
+# GEMINI — analise qualitativa
+# ============================================================================
 def _gemini_sync(api_key: str, prompt: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.0-flash")
-    resp  = model.generate_content(prompt)
+    resp = model.generate_content(prompt)
     return resp.text or ""
+
 
 async def call_gemini(api_key: str, prompt: str) -> str:
     if not api_key:
-        log.warning("GEMINI_API_KEY vazia — análise sem IA")
         return ""
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(_executor, _gemini_sync, api_key, prompt)
-        log.info(f"Gemini OK: {len(result)} chars")
+        log.info("Gemini OK: %d chars" % len(result))
         return result
     except Exception as e:
-        log.error(f"Gemini ERRO: {e}")
+        log.error("Gemini ERRO: %s" % e)
         return ""
 
-ANALYSIS_PROMPT = """Analista de apostas esportivas. Objetivo e técnico.
 
-{home} vs {away} — {league} — {date}
-λ Casa: {lh:.2f} gols/jogo | λ Fora: {la:.2f} gols/jogo
-
-Mercados com valor matemático (EV positivo):
-{opps}
-
-Responda em 3 partes curtas (máx 120 palavras):
-1. VANTAGEM: por que o EV é positivo aqui
-2. RISCO: principal fator que pode invalidar
-3. ENTRADA: mercado exato e odd mínima"""
-
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # TELEGRAM
-# ═══════════════════════════════════════════════════════════════════════════════
+# ============================================================================
 def tg_send_sync(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
-        log.error("Telegram não configurado"); return False
-    url     = f"https://api.telegram.org/bot{token}/sendMessage"
+        log.error("Telegram nao configurado")
+        return False
+    url = "https://api.telegram.org/bot%s/sendMessage" % token
     payload = json.dumps({
         "chat_id": chat_id, "text": text[:4096],
         "parse_mode": "HTML", "disable_web_page_preview": True,
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload,
-        headers={"Content-Type":"application/json"}, method="POST")
+        headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode()).get("ok", False)
     except urllib.error.HTTPError as e:
-        log.error(f"Telegram {e.code}: {e.read().decode()[:200]}")
+        log.error("Telegram %d: %s" % (e.code, e.read().decode()[:200]))
         return False
     except Exception as e:
-        log.error(f"Telegram erro: {e}"); return False
+        log.error("Telegram erro: %s" % e)
+        return False
+
 
 async def tg_send(token, chat_id, text) -> bool:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_executor, tg_send_sync, token, chat_id, text)
 
-async def send_opportunity(token, chat_id, opp) -> bool:
-    nav     = BETANO_PATH.get(opp["market_key"], ("Principais",opp["market_label"],opp["market_label"]))
-    tab, section, option = nav
-    retorno = opp["stake"] * opp["odds"]
-    lucro   = opp["stake"] * (opp["odds"] - 1)
-    odd_min = round(opp["odds"] * 0.97, 2)
-    alt = [m for m in opp.get("all_markets",[])
-           if m["ev_pct"] > 0 and m["label"] != opp["market_label"]][:2]
-    alt_txt = "\n".join(
-        f"   • {m['label']} @ {m['odds']:.2f} — EV {m['ev_pct']:.1f}%" for m in alt
-    ) or "   — Apenas este mercado tem EV positivo"
-    msg = (
-        f"🎯 <b>OPORTUNIDADE DETECTADA</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⚽ <b>{opp['home_team']} vs {opp['away_team']}</b>\n"
-        f"📅 {opp['date']} | {opp['league']}\n\n"
-        f"📊 <b>MERCADO:</b> {opp['market_label']}\n"
-        f"💰 <b>ODD:</b> {opp['odds']:.2f}  |  Mínima: {odd_min}\n"
-        f"📈 <b>EV:</b> +{opp['ev_pct']:.1f}%  |  Edge: {opp['edge_pct']:.1f}%\n"
-        f"🏦 <b>APOSTAR:</b> R$ {opp['stake']:.2f}\n"
-        f"💵 Retorno: R$ {retorno:.2f}  |  Lucro: R$ {lucro:.2f}\n"
-        f"{opp['cls_color']} {opp['cls_label']}\n\n"
-        f"📍 <b>BETANO:</b>\n"
-        f"<code>Futebol → {opp['league']}\n"
-        f"→ {opp['home_team']} vs {opp['away_team']}\n"
-        f"→ {tab} → {section}\n"
-        f"→ {option}</code>\n\n"
-        f"⚠️ Odd mínima: <b>{odd_min}</b>  ⏱ Até 5 min\n\n"
-        f"<b>Outros mercados EV+:</b>\n{alt_txt}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧮 Prob real: {opp['real_prob']*100:.1f}%  "
-        f"Impl: {opp['implied_prob']*100:.1f}%\n"
-        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
-    )
-    return await tg_send(token, chat_id, msg)
 
-async def send_analysis(token, chat_id, opp) -> bool:
-    if not opp.get("ai_analysis"): return False
-    msg = (f"🤖 <b>ANÁLISE DA IA</b>\n"
-           f"{opp['home_team']} vs {opp['away_team']}\n"
-           f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-           f"{opp['ai_analysis'][:3000]}")
-    return await tg_send(token, chat_id, msg)
-
-async def send_diagnostic(token, chat_id, diag, min_ev) -> bool:
-    matches_txt = "\n".join(f"  • {m}" for m in diag["matches_list"][:12]) \
-                  or "  Nenhuma partida encontrada"
-    ev_txt = "\n".join(f"  {e}" for e in diag["ev_results"][:12]) \
-             or "  Nenhum resultado"
-    errors_txt = "\n".join(f"  ⚠ {e}" for e in diag["errors"][:4]) \
-                 if diag["errors"] else ""
-    msg = (
-        f"🔬 <b>DIAGNÓSTICO DO SCAN</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {datetime.now().strftime('%d/%m %H:%M')}\n\n"
-        f"📊 Partidas: <b>{diag['matches_found']}</b>  "
-        f"Com odds: <b>{diag['with_odds']}</b>\n"
-        f"✅ EV positivo: <b>{diag['ev_plus_count']}</b>  "
-        f"EV mínimo: <b>{min_ev:.1f}%</b>\n\n"
-        f"<b>Jogos encontrados:</b>\n{matches_txt}\n\n"
-        f"<b>EV por jogo:</b>\n{ev_txt}"
-    )
-    if errors_txt:
-        msg += f"\n\n<b>Erros:</b>\n{errors_txt}"
-    return await tg_send(token, chat_id, msg)
-
-async def send_startup(token, chat_id, cfg) -> bool:
-    msg = (
-        f"🟢 <b>BETTING AI ENGINE — ONLINE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📡 Dados: football-data.org + The Odds API\n"
-        f"🤖 Análise: Google Gemini\n"
-        f"💰 Banca: R$ {cfg.banca:.2f}\n"
-        f"🛑 Stop loss: R$ {cfg.banca * cfg.stop_loss_pct / 100:.2f}\n"
-        f"📈 EV mínimo: {cfg.min_ev_pct}%\n"
-        f"🔄 Scan a cada {cfg.scan_interval_min} min\n"
-        f"⚽ Ligas: {', '.join(cfg.league_ids)}\n\n"
-        f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-    )
-    return await tg_send(token, chat_id, msg)
-
-async def send_error(token, chat_id, error) -> bool:
-    return await tg_send(token, chat_id,
-        f"⚠️ <b>ERRO</b>\n<code>{str(error)[:400]}</code>\n"
-        f"🕐 {datetime.now().strftime('%d/%m %H:%M')}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SCANNER PRINCIPAL
-# ═══════════════════════════════════════════════════════════════════════════════
-async def scan(cfg: Config) -> Tuple[List[Dict], Dict]:
-    log.info('Scan iniciado — %d ligas' % len(cfg.league_ids))
-    diag = {'matches_found':0,'with_odds':0,'matches_list':[],
-            'ev_results':[],'errors':[],'ev_plus_count':0}
-    loop = asyncio.get_event_loop()
-
-    # 1. Buscar partidas
-    matches_raw = await loop.run_in_executor(
-        _executor, fetch_matches_with_ids, cfg.football_data_key, cfg.league_ids
-    )
-    diag['matches_found'] = len(matches_raw)
-    if not matches_raw:
-        diag['errors'].append('Nenhuma partida encontrada')
-        return [], diag
-
-    # 2. Buscar odds por liga (paralelo)
-    odds_by_league = {}
-    for lid in cfg.league_ids:
-        sport_key = SPORT_KEYS.get(lid)
-        if not sport_key: continue
-        odds_list = await loop.run_in_executor(_executor, fetch_odds, cfg.odds_api_key, sport_key)
-        odds_by_league[lid] = odds_list
-
-    # 3. Processar cada partida
-    opportunities = []
-    for m in matches_raw:
-        name = '%s vs %s' % (m['homeTeam'], m['awayTeam'])
-        diag['matches_list'].append(name)
-        lid = m.get('league_id', '')
-
-        # Odds
-        odds_list = odds_by_league.get(lid, [])
-        odds = match_odds(m['homeTeam'], m['awayTeam'], odds_list)
-        if not odds or not any(v for v in odds.values() if v):
-            diag['ev_results'].append('❌ %s: sem odds' % name)
-            continue
-        diag['with_odds'] += 1
-        # Limitar odds a 4.50 quando usando medias de liga (sem dados reais)
-        # Isso e sobrescrito depois se tiver dados reais do time
-
-        # Stats reais do time (se tiver ID e chave)
-        league_avgs = {
-            'PL':(1.45,1.10),'PD':(1.35,1.00),'SA':(1.30,1.00),
-            'BL1':(1.55,1.15),'FL1':(1.25,0.95),'DED':(1.55,1.20),
-            'PPL':(1.35,1.05),'ELC':(1.40,1.10),'SPL':(1.50,1.15),'TUR':(1.45,1.15),
-            'CL':(1.50,1.10),'EL':(1.45,1.10),'ECL':(1.40,1.05),
-            'EC':(1.25,0.95),'NL':(1.30,1.00),'WC':(1.20,0.90),
-            'BSA':(1.40,1.05),'BSB':(1.35,1.05),'CPB':(1.30,1.00),
-            'CLI':(1.35,1.00),'CSA':(1.30,1.00),'MLS':(1.50,1.15),
-            'APD':(1.45,1.10),'MXN':(1.40,1.05),'COL':(1.35,1.05),
-            'CHI':(1.30,1.00),'URU':(1.35,1.05),'JPL':(1.35,1.00),'CSL':(1.40,1.05),
-        }
-        avg_s, avg_c = league_avgs.get(lid, (1.35, 1.05))
-        home_id = m.get('home_id')
-        away_id = m.get('away_id')
-
-        # Dados reais por time (quando disponivel)
-        home_form = away_form = None
-        if cfg.football_data_key and home_id and away_id:
-            try:
-                home_form = await loop.run_in_executor(_executor, fetch_team_form, cfg.football_data_key, home_id, 6)
-                away_form = await loop.run_in_executor(_executor, fetch_team_form, cfg.football_data_key, away_id, 6)
-            except Exception as e:
-                log.warning('Erro ao buscar form: %s' % e)
-
-        # Calcular lambdas com dados reais ou fallback para media da liga
-        if home_form and home_form['sample'] >= 3 and away_form and away_form['sample'] >= 3:
-            # Dados reais: casa usa home_scored, fora usa away_scored
-            home_attack  = home_form['home_scored']   if home_form['home_scored'] > 0 else home_form['scored']
-            home_defense = home_form['home_conceded'] if home_form['home_conceded'] > 0 else home_form['conceded']
-            away_attack  = away_form['away_scored']   if away_form['away_scored'] > 0 else away_form['scored']
-            away_defense = away_form['away_conceded'] if away_form['away_conceded'] > 0 else away_form['conceded']
-            # Ajuste de forma: time em boa forma marca mais / sofre menos
-            home_attack  *= (0.85 + 0.30 * home_form['form_score'])
-            home_defense *= (1.15 - 0.30 * home_form['form_score'])
-            away_attack  *= (0.85 + 0.30 * away_form['form_score'])
-            away_defense *= (1.15 - 0.30 * away_form['form_score'])
-            data_source = 'real'
-            form_str = '%s | %s' % (home_form['form_str'], away_form['form_str'])
-        else:
-            # Fallback: media da liga + fator campo
-            home_attack  = avg_s * 1.10
-            home_defense = avg_c * 0.90
-            away_attack  = avg_s * 0.90
-            away_defense = avg_c * 1.10
-            data_source = 'liga'
-            form_str = 'N/D'
-
-        markets = analyze_markets(home_attack, home_defense, away_attack, away_defense,
-                                  odds, cfg.banca, cfg.kelly_fraction,
-                                  has_real_data=(data_source == 'real'))
-        if not markets:
-            diag['ev_results'].append('❌ %s: sem mercados validos' % name)
-            continue
-
-        best   = markets[0]
-        ev_str = '%s: EV %+.1f%% (%s @ %.2f) [%s]' % (
-            name, best['ev_pct'], best['label'], best['odds'], data_source)
-        log.info('  ' + ev_str)
-
-        if best['ev_pct'] > 0:
-            diag['ev_results'].append('✅ ' + ev_str)
-            diag['ev_plus_count'] += 1
-        else:
-            diag['ev_results'].append('➖ ' + ev_str)
-            continue
-
-        # Analise Gemini — apenas para os top 5 por EV (controlado depois)
-        lh = home_attack * away_defense
-        la = away_attack * home_defense
-        opportunities.append({
-            'home_team': m['homeTeam'], 'away_team': m['awayTeam'],
-            'league': m['league'], 'date': m['date'],
-            'home_form': home_form, 'away_form': away_form,
-            'form_str': form_str, 'data_source': data_source,
-            'lh': round(lh,3), 'la': round(la,3),
-            'market_key': best['key'], 'market_label': best['label'],
-            'odds': best['odds'], 'real_prob': best['prob'],
-            'implied_prob': best['implied'], 'ev_pct': best['ev_pct'],
-            'edge_pct': best['edge_pct'], 'kelly': best['kelly'],
-            'stake': best['stake'], 'cls_label': best['cls_label'],
-            'cls_color': best['cls_color'], 'all_markets': markets,
-            'ai_analysis': '',
-        })
-
-    opportunities.sort(key=lambda x: x['ev_pct'], reverse=True)
-
-    # Gemini apenas para top 3 — evita quota 429
-    for i, opp in enumerate(opportunities[:3]):
-        try:
-            opps_txt = '\n'.join(
-                '%d. %s: EV %.1f%% | Edge %.1f%% | Odd %.2f' %
-                (j+1, mk['label'], mk['ev_pct'], mk['edge_pct'], mk['odds'])
-                for j, mk in enumerate(opp['all_markets'][:3])
-            )
-            hf = opp.get('home_form') or {}
-            af = opp.get('away_form') or {}
-            form_context = ''
-            if hf.get('sample',0) >= 3:
-                form_context = ('Forma: %s(casa) gols %.1f/%.1f | %s(fora) gols %.1f/%.1f' % (
-                    opp['home_team'], hf.get('scored',0), hf.get('conceded',0),
-                    opp['away_team'], af.get('scored',0), af.get('conceded',0)))
-            prompt = (
-                'Analista quantitativo de apostas. Tecnico e direto.\n'
-                '%s vs %s — %s — %s\n'
-                'Lambda casa: %.3f gols/jogo | Lambda fora: %.3f gols/jogo\n'
-                'Fonte dos dados: %s\n'
-                '%s\n'
-                'Forma recente: %s\n\n'
-                'Mercados EV+:\n%s\n\n'
-                '3 partes (max 130 palavras):\n'
-                '1. VANTAGEM MATEMATICA\n'
-                '2. RISCO PRINCIPAL\n'
-                '3. ENTRADA RECOMENDADA (mercado + odd minima)'
-            ) % (
-                opp['home_team'], opp['away_team'], opp['league'], opp['date'],
-                opp['lh'], opp['la'], opp['data_source'], form_context,
-                opp['form_str'], opps_txt,
-            )
-            opp['ai_analysis'] = await call_gemini(cfg.gemini_api_key, prompt)
-            if i < 2: await asyncio.sleep(5)
-        except Exception as e:
-            log.warning('Gemini erro: %s' % e)
-            opp['ai_analysis'] = ''
-
-    log.info('Scan: %d EV+ de %d partidas (%d com odds)' % (
-        len(opportunities), diag['matches_found'], diag['with_odds']))
-    return opportunities, diag
-
-class Memory:
-    def __init__(self, path='data/history.json'):
-        self.path = path
-        self.data = self._load()
-
-    def _load(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path,'r',encoding='utf-8') as f: return json.load(f)
-            except Exception: pass
-        return {'tips':[],'perf':{'sent':0,'wins':0,'losses':0,'staked':0.0,'returned':0.0},'banca':None,'silent_until':None}
-
-    def _save(self):
-        try:
-            with open(self.path,'w',encoding='utf-8') as f:
-                json.dump(self.data,f,ensure_ascii=False,indent=2)
-        except Exception as e: log.error('Erro ao salvar: %s' % e)
-
-    # ── BANCA ─────────────────────────────────────────────────────────────────
-    def get_banca(self, cfg_banca): return self.data.get('banca') or cfg_banca
-
-    def set_banca(self, valor):
-        self.data['banca'] = round(float(valor), 2)
-        self._save()
-        log.info('Banca atualizada: R$ %.2f' % valor)
-
-    def registrar_resultado(self, ganhou, valor):
-        banca = self.data.get('banca', 0) or 0
-        p = self.data['perf']
-        if ganhou:
-            p['wins']     += 1
-            p['returned']  = p.get('returned',0) + valor
-            nova = round(banca + valor, 2)
-        else:
-            p['losses']   += 1
-            p['staked']    = p.get('staked',0) + valor
-            nova = round(max(0, banca - valor), 2)
-        self.data['banca'] = nova
-        self._save()
-        return nova
-
-    # ── MODO SILENCIOSO ───────────────────────────────────────────────────────
-    def is_silent(self):
-        until = self.data.get('silent_until')
-        if not until: return False
-        from datetime import datetime as _dt
-        try:
-            return _dt.now() < _dt.fromisoformat(until)
-        except Exception: return False
-
-    def set_silent(self, hours):
-        from datetime import datetime as _dt, timedelta as _td
-        until = (_dt.now() + _td(hours=hours)).isoformat()
-        self.data['silent_until'] = until
-        self._save()
-        return until
-
-    def clear_silent(self):
-        self.data['silent_until'] = None
-        self._save()
-
-    # ── HISTORICO ─────────────────────────────────────────────────────────────
-    def already_sent_today(self, key) -> bool:
-        today = date.today().isoformat()
-        return any(t['match']==key and t['date']==today for t in self.data['tips'])
-
-    def record(self, key, opp):
-        self.data['tips'].append({
-            'match':key,'market':opp.get('market_key',''),
-            'league':opp.get('league',''),'odds':opp.get('odds',0),
-            'stake':opp.get('stake',0),'ev_pct':opp.get('ev_pct',0),
-            'date':date.today().isoformat(),'outcome':None,
-            'home_team':opp.get('home_team',''),'away_team':opp.get('away_team',''),
-        })
-        self.data['perf']['sent'] += 1
-        if len(self.data['tips']) > 1000:
-            self.data['tips'] = self.data['tips'][-1000:]
-        self._save()
-
-    def get_pending_results(self, days_back=2):
-        from datetime import datetime as _dt, timedelta as _td
-        cutoff = (_dt.now() - _td(days=days_back)).date().isoformat()
-        return [
-            t for t in self.data['tips']
-            if t.get('outcome') is None
-            and t.get('market','') != 'strategy'
-            and t.get('date','') >= cutoff
-            and t.get('home_team','')
-        ]
-
-    def update_outcome(self, tip_id_or_match, outcome, returned=0.0):
-        for t in self.data['tips']:
-            if t.get('match') == tip_id_or_match and t.get('outcome') is None:
-                t['outcome']  = outcome
-                t['returned'] = returned
-                p = self.data['perf']
-                if outcome == 'win':
-                    p['wins']     += 1
-                    p['returned']  = p.get('returned',0) + returned
-                    banca = self.data.get('banca',0) or 0
-                    self.data['banca'] = round(banca + returned - t.get('stake',0), 2)
-                elif outcome == 'loss':
-                    p['losses']  += 1
-                    p['staked']   = p.get('staked',0) + t.get('stake',0)
-                self._save()
-                return True
-        return False
-
-    # ── ESTATISTICAS ──────────────────────────────────────────────────────────
-    def get_stats(self):
-        p = self.data['perf']
-        total = p['wins'] + p['losses']
-        wr    = (p['wins']/total*100) if total > 0 else 0
-        staked   = p.get('staked',0)
-        returned = p.get('returned',0)
-        roi = ((returned-staked)/staked*100) if staked > 0 else 0
-        return {
-            'banca':    self.data.get('banca',0),
-            'enviados': p['sent'], 'wins': p['wins'], 'losses': p['losses'],
-            'total': total, 'win_rate': round(wr,1), 'roi': round(roi,1),
-            'staked': round(staked,2), 'returned': round(returned,2),
-        }
-
-    def get_weekly_stats(self):
-        from datetime import datetime as _dt, timedelta as _td
-        week_ago = (_dt.now() - _td(days=7)).date().isoformat()
-        tips = [t for t in self.data['tips'] if t.get('date','') >= week_ago and t.get('market','') != 'strategy']
-        wins    = sum(1 for t in tips if t.get('outcome')=='win')
-        losses  = sum(1 for t in tips if t.get('outcome')=='loss')
-        staked  = sum(t.get('stake',0) for t in tips if t.get('outcome') in ('win','loss'))
-        returned= sum(t.get('returned',0) for t in tips if t.get('outcome')=='win')
-        roi     = ((returned-staked)/staked*100) if staked > 0 else 0
-        best    = max((t for t in tips if t.get('outcome')=='win'), key=lambda x: x.get('returned',0), default=None)
-        worst   = max((t for t in tips if t.get('outcome')=='loss'), key=lambda x: x.get('stake',0), default=None)
-        by_league = {}
-        for t in tips:
-            lg = t.get('league','?')
-            if lg not in by_league: by_league[lg] = {'w':0,'l':0}
-            if t.get('outcome')=='win': by_league[lg]['w'] += 1
-            elif t.get('outcome')=='loss': by_league[lg]['l'] += 1
-        return {
-            'total': len(tips), 'wins': wins, 'losses': losses,
-            'pending': len(tips)-wins-losses,
-            'staked': round(staked,2), 'returned': round(returned,2),
-            'roi': round(roi,1),
-            'win_rate': round(wins/(wins+losses)*100,1) if (wins+losses)>0 else 0,
-            'best': best, 'worst': worst,
-            'by_league': by_league,
-        }
-
-    def needs_weekly_report(self):
-        today = date.today()
-        if today.weekday() != 6: return False  # so domingo
-        key = 'weekly-report-%s' % today.isoformat()
-        return not self.already_sent_today(key)
-
-    def get_adaptive_min_ev(self, base):
-        p = self.data['perf']
-        total = p['wins'] + p['losses']
-        if total < 20: return base
-        wr = p['wins'] / total
-        if wr > 0.58: return max(base*0.85, 2.0)
-        if wr < 0.38: return base*1.25
-        return base
-
-
-from itertools import combinations as _comb
-
-def _combined_odd(sels):
-    r = 1.0
-    for o in sels: r *= o["odds"]
-    return round(r, 2)
-
-def _combined_prob(sels):
-    r = 1.0
-    for o in sels: r *= o["real_prob"]
-    return r
-
-def _combined_ev(sels):
-    p = _combined_prob(sels)
-    od = _combined_odd(sels)
-    return calc_ev(p, od)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MODO DE BANCA
-# ═══════════════════════════════════════════════════════════════════════════════
-def get_banca_mode(banca):
-    if banca <= 50:
-        return {
-            "nome": "SOBREVIVENCIA", "emoji": "🔴",
-            "descricao": "Banca crítica — foco em preservação e alavancagem segura",
-            "kelly_frac": 0.08, "max_apostas": 1,
-            "min_prob": 0.48, "min_odds": 1.40, "max_odds": 5.00,
-            "min_ev": 4.0, "dupla_ok": True,
-            "dupla_min_prob": 0.58, "dupla_min_ev": 0.05, "kelly_dupla": 0.10,
-            "tripla_ok": False, "yankee_ok": False, "canadian_ok": False,
-            "aposta_min": 1.00,
-            "objetivo": "Dobrar a banca antes de qualquer outra estrategia",
-        }
-    elif banca <= 200:
-        return {
-            "nome": "RECUPERACAO", "emoji": "🟡",
-            "descricao": "Banca baixa — crescimento gradual com risco controlado",
-            "kelly_frac": 0.12, "max_apostas": 2,
-            "min_prob": 0.50, "min_odds": 1.40, "max_odds": 2.80,
-            "min_ev": 3.0, "dupla_ok": True,
-            "dupla_min_prob": 0.52, "dupla_min_ev": 0.03, "kelly_dupla": 0.12,
-            "tripla_ok": False, "yankee_ok": False, "canadian_ok": False,
-            "aposta_min": 1.00,
-            "objetivo": "Atingir R$200 com disciplina e entradas selecionadas",
-        }
-    elif banca <= 500:
-        return {
-            "nome": "CRESCIMENTO", "emoji": "🟢",
-            "descricao": "Banca media — estrategia equilibrada",
-            "kelly_frac": 0.18, "max_apostas": 3,
-            "min_prob": 0.46, "min_odds": 1.30, "max_odds": 3.50,
-            "min_ev": 2.0, "dupla_ok": True,
-            "dupla_min_prob": 0.48, "dupla_min_ev": 0.02, "kelly_dupla": 0.15,
-            "tripla_ok": True, "yankee_ok": False, "canadian_ok": False,
-            "aposta_min": 1.00,
-            "objetivo": "Crescimento consistente rumo a R$500+",
-        }
-    else:
-        return {
-            "nome": "NORMAL", "emoji": "🔵",
-            "descricao": "Banca saudavel — sistema completo ativo",
-            "kelly_frac": 0.25, "max_apostas": 99,
-            "min_prob": 0.44, "min_odds": 1.20, "max_odds": 5.00,
-            "min_ev": 1.0, "dupla_ok": True,
-            "dupla_min_prob": 0.46, "dupla_min_ev": 0.02, "kelly_dupla": 0.15,
-            "tripla_ok": True, "yankee_ok": True, "canadian_ok": True,
-            "aposta_min": 1.00,
-            "objetivo": "Maximizar crescimento com diversificacao total",
-        }
-
-
-def filter_by_mode(opps, mode, banca):
-    """
-    Filtra oportunidades pelo modo de banca.
-    - min_prob: probabilidade minima calculada pelo Poisson
-    - max_odds: apenas para ESTRATEGIA (multiplas) — alertas individuais aceitam ate 5.00
-    - min_ev: EV minimo configurado
-    """
-    result = []
-    for o in opps:
-        # Filtro de probabilidade minima — garante qualidade do modelo
-        if o["real_prob"] < mode["min_prob"]: continue
-        # Filtro de odds para alerta individual: 1.30 ate 5.00
-        # (acima de 5.00 o modelo com medias de liga nao e confiavel)
-        if not (mode["min_odds"] <= o["odds"] <= 5.00): continue
-        # Filtro de EV minimo
-        if o["ev_pct"] < mode["min_ev"]: continue
-        kf    = mode["kelly_frac"]
-        stake = banca * calc_kelly(o["real_prob"], o["odds"], kf)
-        stake = max(mode["aposta_min"], round(stake, 2))
-        stake = min(stake, banca * 0.20)
-        o2 = dict(o)
-        o2["stake"] = stake
-        result.append(o2)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MOTOR DE ESTRATEGIA
-# ═══════════════════════════════════════════════════════════════════════════════
-from itertools import combinations as _comb
-
-def _combined_odd(sels):
-    r = 1.0
-    for o in sels: r *= o["odds"]
-    return round(r, 2)
-
-def _combined_prob(sels):
-    r = 1.0
-    for o in sels: r *= o["real_prob"]
-    return r
-
-def _combined_ev(sels):
-    return calc_ev(_combined_prob(sels), _combined_odd(sels))
-
-
-def assess_day(opps, banca, min_ev_cfg):
-    mode      = get_banca_mode(banca)
-    filtered  = filter_by_mode(opps, mode, banca)
-    n         = len(filtered)
-    good      = filtered[:mode["max_apostas"]]
-    strong    = [o for o in filtered if o["ev_pct"] >= mode["min_ev"] + 2]
-    leagues   = [o["league"] for o in good]
-    n_leagues = len(set(leagues))
-    diversified = n_leagues >= max(1, len(good) // 2)
-    base = {"n": n, "strong": len(strong), "n_leagues": n_leagues, "mode": mode, "banca": banca}
-
-    if n == 0:
-        return dict(base, rec="AGUARDAR", type=None, sels=[],
-            reason=("Nenhuma entrada passa os criterios do modo %s. Prob min: %.0f%%, Odds: %.2f-%.2f, EV min: %.1f%%."
-                    % (mode["nome"], mode["min_prob"]*100, mode["min_odds"], mode["max_odds"], mode["min_ev"])),
-            action="Nao apostar. Monitorando proximas rodadas.",
-            risk="NULO", color="⬜")
-
-    if mode["nome"] == "SOBREVIVENCIA":
-        best = good[0]
-        if len(good) >= 2 and mode["dupla_ok"]:
-            o1, o2 = good[0], good[1]
-            if o1["real_prob"] >= mode["dupla_min_prob"] and o2["real_prob"] >= mode["dupla_min_prob"]:
-                ev2 = _combined_ev([o1, o2])
-                od2 = _combined_odd([o1, o2])
-                p2  = _combined_prob([o1, o2])
-                if ev2 >= mode["dupla_min_ev"]:
-                    stake2 = max(mode["aposta_min"], round(banca * calc_kelly(p2, od2, mode["kelly_dupla"]), 2))
-                    stake2 = min(stake2, banca * 0.35)
-                    ret2   = round(stake2 * od2, 2)
-                    return dict(base, rec="DUPLA ALAVANCAGEM", type="double", sels=[o1, o2],
-                        comb_odd=od2, comb_ev=round(ev2*100,1), comb_prob=round(p2*100,1),
-                        stake=stake2, ret=ret2,
-                        reason=("Banca critica (R$ %.2f). Dupla de alavancagem: ambas prob >= %.0f%% e EV combinado +%.1f%%. Retorno R$ %.2f."
-                                % (banca, mode["dupla_min_prob"]*100, ev2*100, ret2)),
-                        action=("Aposte R$ %.2f na dupla (odd %.2f). STOP LOSS: R$ %.2f."
-                                % (stake2, od2, banca * 0.50)),
-                        risk="CONTROLADO", color="🟡")
-        stake1 = max(mode["aposta_min"], round(banca * calc_kelly(best["real_prob"], best["odds"], mode["kelly_frac"]), 2))
-        stake1 = min(stake1, banca * 0.25)
-        return dict(base, rec="SIMPLES CIRURGICA", type="single", sels=[best],
-            reason=("Banca critica (R$ %.2f). 1 entrada precisa: prob %.1f%%, EV +%.1f%%."
-                    % (banca, best["real_prob"]*100, best["ev_pct"])),
-            action=("Aposte R$ %.2f em %s vs %s — %s @ %.2f. Stop loss: R$ %.2f."
-                    % (stake1, best["home_team"], best["away_team"], best["market_label"], best["odds"], banca*0.50)),
-            risk="BAIXO-CONTROLADO", color="🟢")
-
-    if mode["nome"] == "RECUPERACAO":
-        if len(good) == 1:
-            o = good[0]
-            return dict(base, rec="SIMPLES", type="single", sels=[o],
-                reason=("1 oportunidade valida. EV +%.1f%%, prob %.1f%%."
-                        % (o["ev_pct"], o["real_prob"]*100)),
-                action=("Aposte R$ %.2f em %s vs %s — %s @ %.2f."
-                        % (o["stake"], o["home_team"], o["away_team"], o["market_label"], o["odds"])),
-                risk="BAIXO", color="🟢")
-        o1, o2 = good[0], good[1]
-        ev2 = _combined_ev([o1, o2])
-        od2 = _combined_odd([o1, o2])
-        p2  = _combined_prob([o1, o2])
-        if ev2 >= mode["dupla_min_ev"] and o1["real_prob"] >= mode["dupla_min_prob"] and diversified:
-            stake2 = max(mode["aposta_min"], round(banca * calc_kelly(p2, od2, mode["kelly_dupla"]), 2))
-            stake2 = min(stake2, banca * 0.20)
-            return dict(base, rec="DUPLA + 2 SIMPLES", type="double_plus", sels=[o1, o2],
-                comb_odd=od2, comb_ev=round(ev2*100,1), comb_prob=round(p2*100,1),
-                stake=stake2, ret=round(stake2*od2,2),
-                total_alt=round(o1["stake"]+o2["stake"],2),
-                reason=("2 oportunidades EV combinado +%.1f%%. Dupla ou 2 simples separadas." % (ev2*100)),
-                action=("OPCAO A — Dupla: R$ %.2f (odd %.2f, retorno R$ %.2f).\nOPCAO B — Simples: R$ %.2f + R$ %.2f."
-                        % (stake2, od2, round(stake2*od2,2), o1["stake"], o2["stake"])),
-                risk="MODERADO", color="🟡")
-        return dict(base, rec="SIMPLES SEPARADAS", type="singles", sels=good[:2],
-            reason=("2 oportunidades. Dupla nao justificada (EV %.1f%%)." % (ev2*100)),
-            action=("Aposte R$ %.2f e R$ %.2f separadamente." % (good[0]["stake"], good[1]["stake"])),
-            total_stake=round(sum(o["stake"] for o in good[:2]),2),
-            risk="BAIXO", color="🟢")
-
-    if mode["nome"] == "CRESCIMENTO":
-        if len(good) >= 3 and len(strong) >= 2:
-            top3 = good[:3]
-            ev3 = _combined_ev(top3); od3 = _combined_odd(top3); p3 = _combined_prob(top3)
-            if ev3 > 0.04 and diversified:
-                stake3 = max(1.0, round(banca * calc_kelly(p3, od3, 0.08), 2))
-                return dict(base, rec="TRIPLA INTELIGENTE", type="treble", sels=top3,
-                    comb_odd=od3, comb_ev=round(ev3*100,1), comb_prob=round(p3*100,1),
-                    stake=stake3, ret=round(stake3*od3,2),
-                    reason=("3 selecoes EV combinado +%.1f%% em %d ligas." % (ev3*100, n_leagues)),
-                    action=("R$ %.2f na tripla (odd %.2f, retorno R$ %.2f)." % (stake3, od3, round(stake3*od3,2))),
-                    risk="MODERADO", color="🟡")
-        if len(good) >= 2:
-            o1, o2 = good[0], good[1]
-            ev2 = _combined_ev([o1,o2]); od2 = _combined_odd([o1,o2]); p2 = _combined_prob([o1,o2])
-            if ev2 > 0.02:
-                stake2 = max(1.0, round(banca * calc_kelly(p2, od2, mode["kelly_dupla"]), 2))
-                return dict(base, rec="DUPLA", type="double", sels=[o1,o2],
-                    comb_odd=od2, comb_ev=round(ev2*100,1), comb_prob=round(p2*100,1),
-                    stake=stake2, ret=round(stake2*od2,2),
-                    reason=("2 oportunidades solidas. EV combinado +%.1f%%." % (ev2*100)),
-                    action=("R$ %.2f na dupla (odd %.2f)." % (stake2, od2)),
-                    risk="MODERADO", color="🟡")
-        return dict(base, rec="SIMPLES SEPARADAS", type="singles", sels=good,
-            reason=("%d oportunidades. Kelly %.0f%% por entrada." % (n, mode["kelly_frac"]*100)),
-            action="Aposte cada uma separadamente.",
-            total_stake=round(sum(o["stake"] for o in good),2),
-            risk="BAIXO", color="🟢")
-
-    # Modo NORMAL
-    if len(good) >= 5 and len(strong) >= 4:
-        top5 = good[:5]; unit5 = round(banca*0.004,2)
-        best2 = max(_combined_ev(list(c))*100 for c in _comb(top5,2))
-        return dict(base, rec="CANADIAN", type="canadian", sels=top5,
-            count=26, unit=unit5, total_stake=round(unit5*26,2),
-            max_ret=round(unit5*_combined_odd(top5),2), best_ev2=round(best2,1),
-            reason=("%d selecoes fortes em %d ligas." % (n, n_leagues)),
-            action=("26 apostas x R$ %.2f = R$ %.2f total." % (unit5, unit5*26)),
-            risk="ALTO", color="🔴")
-    if len(good) >= 4 and len(strong) >= 3:
-        top4 = good[:4]; unit = round(banca*0.005,2)
-        min_od = min(_combined_odd(list(c)) for c in _comb(top4,2))
-        best2  = max(_combined_ev(list(c))*100 for c in _comb(top4,2))
-        return dict(base, rec="YANKEE", type="yankee", sels=top4,
-            count=11, unit=unit, total_stake=round(unit*11,2),
-            max_ret=round(unit*_combined_odd(top4),2), min_od=round(min_od,2), best_ev2=round(best2,1),
-            reason=("%d selecoes fortes. Basta 2/4 (odd min %.2f)." % (len(strong), min_od)),
-            action=("11 apostas x R$ %.2f = R$ %.2f total." % (unit, unit*11)),
-            risk="MODERADO-ALTO", color="🟠")
-    if len(good) >= 3:
-        top3 = good[:3]
-        ev3 = _combined_ev(top3); od3 = _combined_odd(top3); p3 = _combined_prob(top3)
-        if ev3 > 0.03:
-            stake3 = max(1.0, round(banca * calc_kelly(p3, od3, 0.10), 2))
-            return dict(base, rec="TRIPLA", type="treble", sels=top3,
-                comb_odd=od3, comb_ev=round(ev3*100,1), comb_prob=round(p3*100,1),
-                stake=stake3, ret=round(stake3*od3,2),
-                reason=("3 selecoes EV combinado +%.1f%%." % (ev3*100)),
-                action=("R$ %.2f na tripla (odd %.2f)." % (stake3, od3)),
-                risk="MODERADO", color="🟡")
-    if len(good) >= 2:
-        o1, o2 = good[0], good[1]
-        ev2 = _combined_ev([o1,o2]); od2 = _combined_odd([o1,o2]); p2 = _combined_prob([o1,o2])
-        if ev2 > 0.02:
-            stake2 = max(1.0, round(banca * calc_kelly(p2, od2, 0.15), 2))
-            return dict(base, rec="DUPLA", type="double", sels=[o1,o2],
-                comb_odd=od2, comb_ev=round(ev2*100,1), comb_prob=round(p2*100,1),
-                stake=stake2, ret=round(stake2*od2,2),
-                reason=("2 selecoes EV combinado +%.1f%%." % (ev2*100)),
-                action=("R$ %.2f na dupla (odd %.2f)." % (stake2, od2)),
-                risk="MODERADO", color="🟡")
-    return dict(base, rec="SIMPLES SEPARADAS", type="singles", sels=good,
-        reason=("%d oportunidades. Kelly %.0f%%." % (n, mode["kelly_frac"]*100)),
-        action="Aposte cada uma separadamente.",
-        total_stake=round(sum(o["stake"] for o in good),2),
-        risk="BAIXO", color="🟢")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENVIO DA ESTRATEGIA
-# ═══════════════════════════════════════════════════════════════════════════════
-async def send_strategy(token, chat_id, strat, banca, gemini_key):
-    mode  = strat.get("mode", {})
-    rec   = strat["rec"]
-    color = strat["color"]
-    risk  = strat["risk"]
-    sels  = strat.get("sels", [])
-    n     = strat["n"]
-
-    mode_line = "%s Modo: <b>%s</b> — %s" % (mode.get("emoji",""), mode.get("nome",""), mode.get("descricao",""))
-
-    sel_lines = []
-    for i, o in enumerate(sels):
-        sel_lines.append(
-            "  %d. %s vs %s\n     %s @ %.2f | EV +%.1f%% | Prob %.1f%%" %
-            (i+1, o["home_team"], o["away_team"], o["market_label"], o["odds"], o["ev_pct"], o["real_prob"]*100))
-    sels_txt = "\n".join(sel_lines) if sel_lines else "  Nenhuma selecao hoje"
-
-    t = strat.get("type")
-    extra_lines = []
-    if t in ("double", "double_plus", "treble"):
-        extra_lines = [
-            "📊 Odd combinada: <b>%.2f</b>" % strat.get("comb_odd", 0),
-            "📈 EV combinado: <b>+%.1f%%</b>" % strat.get("comb_ev", 0),
-            "🎯 Prob de acerto: <b>%.1f%%</b>" % strat.get("comb_prob", 0),
-            "💰 Apostar: <b>R$ %.2f</b>" % strat.get("stake", 0),
-            "💵 Retorno se acertar: <b>R$ %.2f</b>" % strat.get("ret", 0),
-        ]
-        if t == "double_plus":
-            extra_lines.append("↔️ Alt (2 simples): R$ %.2f total" % strat.get("total_alt", 0))
-    elif t == "yankee":
-        extra_lines = [
-            "📋 11 apostas x R$ %.2f = <b>R$ %.2f total</b>" % (strat.get("unit",0), strat.get("total_stake",0)),
-            "🛡 Ret min (2/4): odd %.2f" % strat.get("min_od", 0),
-            "🏆 Ret max (4/4): R$ %.2f" % strat.get("max_ret", 0),
-        ]
-    elif t == "canadian":
-        extra_lines = [
-            "📋 26 apostas x R$ %.2f = <b>R$ %.2f total</b>" % (strat.get("unit",0), strat.get("total_stake",0)),
-            "🏆 Ret max: R$ %.2f" % strat.get("max_ret", 0),
-        ]
-    elif t in ("singles", "single"):
-        ts = strat.get("total_stake", sum(o.get("stake",0) for o in sels))
-        extra_lines = ["💰 Total: <b>R$ %.2f</b>" % ts]
-    extra_txt = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
-
-    msg = (
-        "📋 <b>ESTRATEGIA DO DIA</b> — %s\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "%s\n"
-        "💰 Banca atual: <b>R$ %.2f</b>\n"
-        "🎯 Objetivo: %s\n\n"
-        "%s <b>RECOMENDACAO: %s</b>\n"
-        "⚖️ Risco: %s\n"
-        "📊 %d validas | %d fortes\n\n"
-        "<b>Selecoes:</b>\n%s\n"
-        "%s\n\n"
-        "<b>Por que:</b>\n%s\n\n"
-        "<b>Como executar:</b>\n%s"
-    ) % (
-        datetime.now().strftime("%d/%m/%Y"),
-        mode_line, banca, mode.get("objetivo",""),
-        color, rec, risk, n, strat["strong"],
-        sels_txt, extra_txt,
-        strat.get("reason",""), strat.get("action",""),
-    )
-    ok = await tg_send(token, chat_id, msg)
-    await asyncio.sleep(2)
-
-    if sels and gemini_key:
-        sel_sum = "; ".join(
-            "%s vs %s %s @%.2f EV+%.1f%% Prob%.1f%%" %
-            (o["home_team"], o["away_team"], o["market_label"], o["odds"], o["ev_pct"], o["real_prob"]*100)
-            for o in sels)
-        prompt = (
-            "Analista profissional de apostas. Direto e tecnico.\n"
-            "SITUACAO: Banca R$ %.2f | Modo %s (%s) | Objetivo: %s\n"
-            "ESTRATEGIA: %s | Risco: %s\n"
-            "SELECOES: %s\n"
-            "MOTIVO: %s\n\n"
-            "Analise em 4 partes (max 200 palavras):\n"
-            "1. SITUACAO DE BANCA: avalie o contexto com R$ %.2f\n"
-            "2. VALIDACAO: concorda com a estrategia?\n"
-            "3. RISCO REAL: o que pode dar errado hoje\n"
-            "4. CONSELHO FINAL: instrucao clara e direta"
-        ) % (banca, mode.get("nome",""), mode.get("descricao",""), mode.get("objetivo",""),
-             rec, risk, sel_sum, strat.get("reason",""), banca)
-        ai_txt = await call_gemini(gemini_key, prompt)
-        if ai_txt:
-            await tg_send(token, chat_id,
-                "🧠 <b>ANALISE DA IA — ESTRATEGIA</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n\n%s" % ai_txt[:3500])
-    return ok
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOOP PRINCIPAL
-# ═══════════════════════════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════════════════════════
-# HANDLER DE COMANDOS DO TELEGRAM
-# ═══════════════════════════════════════════════════════════════════════════════
 def tg_get_updates_sync(token, offset=0):
     url = "https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=5" % (token, offset)
     req = urllib.request.Request(url)
@@ -1387,62 +654,698 @@ def tg_get_updates_sync(token, offset=0):
         return []
 
 
-async def send_weekly_report(token, chat_id, memory, gemini_key):
-    stats = memory.get_weekly_stats()
-    w = stats
-    by_league_txt = ""
-    for lg, s in sorted(w["by_league"].items(), key=lambda x: x[1]["w"]+x[1]["l"], reverse=True)[:5]:
-        wr = round(s["w"]/(s["w"]+s["l"])*100,0) if (s["w"]+s["l"])>0 else 0
-        by_league_txt += "  %s: %dV %dD (%.0f%%)\n" % (lg, s["w"], s["l"], wr)
-
-    best_txt  = ("%s vs %s +R$%.2f" % (w["best"]["home_team"],  w["best"]["away_team"],  w["best"].get("returned",0)))  if w.get("best")  else "—"
-    worst_txt = ("%s vs %s -R$%.2f" % (w["worst"]["home_team"], w["worst"]["away_team"], w["worst"].get("stake",0)))    if w.get("worst") else "—"
+async def send_entry(token, chat_id, entry, cfg: Config) -> bool:
+    nav = BETANO_PATH.get(entry["market_key"], ("Principais", entry["market_label"], entry["market_label"]))
+    tab, section, option = nav
+    retorno = entry["stake"] * entry["odds"]
+    lucro   = entry["stake"] * (entry["odds"] - 1)
 
     msg = (
-        "📊 <b>RELATORIO SEMANAL</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📅 Semana encerrada em %s\n\n"
-        "📤 Sinais enviados: <b>%d</b>\n"
-        "✅ Vitorias: <b>%d</b>\n"
-        "❌ Derrotas: <b>%d</b>\n"
-        "⏳ Pendentes: <b>%d</b>\n"
-        "🎯 Win rate: <b>%.1f%%</b>\n"
-        "💰 Total apostado: R$ %.2f\n"
-        "💵 Total retornado: R$ %.2f\n"
-        "📈 ROI da semana: <b>%+.1f%%</b>\n\n"
-        "<b>Por liga:</b>\n%s\n"
-        "<b>Melhor entrada:</b> %s\n"
-        "<b>Pior entrada:</b> %s\n\n"
-        "Sistema continua monitorando. 💪"
+        "FAVORITO DE ALTA PROBABILIDADE\n"
+        "------------------------------\n\n"
+        "<b>%s vs %s</b>\n"
+        "%s | %s\n\n"
+        "MERCADO: %s\n"
+        "ODD: %.2f\n"
+        "PROBABILIDADE REAL: %.1f%%\n"
+        "PROBABILIDADE IMPLICITA: %.1f%%\n\n"
+        "APOSTAR: R$ %.2f\n"
+        "RETORNO: R$ %.2f | LUCRO: R$ %.2f\n\n"
+        "BETANO:\n"
+        "<code>Futebol -> %s\n"
+        "-> %s vs %s\n"
+        "-> %s -> %s\n"
+        "-> %s</code>\n\n"
+        "%s"
     ) % (
-        date.today().strftime("%d/%m/%Y"),
-        w["total"], w["wins"], w["losses"], w["pending"],
-        w["win_rate"], w["staked"], w["returned"], w["roi"],
-        by_league_txt or "  Sem dados\n",
-        best_txt, worst_txt,
+        entry["home_team"], entry["away_team"],
+        entry["league"], entry["date"],
+        entry["market_label"], entry["odds"],
+        entry["prob"] * 100, entry["implied"] * 100,
+        entry["stake"], retorno, lucro,
+        entry["league"], entry["home_team"], entry["away_team"],
+        tab, section, option,
+        datetime.now().strftime("%H:%M:%S"),
     )
     ok = await tg_send(token, chat_id, msg)
 
-    # Analise Gemini do desempenho semanal
-    if gemini_key and w["total"] > 0:
+    if ok and cfg.gemini_api_key:
+        await asyncio.sleep(1)
         prompt = (
-            "Analista de apostas. Avalie o desempenho semanal:\n"
-            "Sinais: %d | Vitorias: %d | Derrotas: %d | Win rate: %.1f%% | ROI: %+.1f%%\n"
-            "Apostado: R$ %.2f | Retornado: R$ %.2f\n"
-            "Responda em 3 partes (max 150 palavras):\n"
-            "1. AVALIACAO: como foi a semana matematicamente\n"
-            "2. PADROES: o que os resultados indicam\n"
-            "3. AJUSTE: o que mudar na proxima semana"
-        ) % (w["total"], w["wins"], w["losses"], w["win_rate"], w["roi"], w["staked"], w["returned"])
-        ai = await call_gemini(gemini_key, prompt)
-        if ai:
-            await tg_send(token, chat_id,
-                "🧠 <b>ANALISE SEMANAL DA IA</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n%s" % ai[:3000])
+            "Analista de apostas esportivas. Tecnico e direto.\n"
+            "%s vs %s - %s\n"
+            "Mercado escolhido: %s @ %.2f\n"
+            "Probabilidade calculada pelo modelo: %.1f%%\n\n"
+            "Responda em 2 partes curtas (max 100 palavras):\n"
+            "1. POR QUE E FAVORITO: o que sustenta essa alta probabilidade\n"
+            "2. RISCO: o unico fator que poderia surpreender"
+        ) % (entry["home_team"], entry["away_team"], entry["league"],
+             entry["market_label"], entry["odds"], entry["prob"] * 100)
+        ai_txt = await call_gemini(cfg.gemini_api_key, prompt)
+        if ai_txt:
+            await tg_send(token, chat_id, "ANALISE DA IA\n-------------\n\n%s" % ai_txt[:2000])
+
     return ok
 
 
-async def process_commands(cfg, memory):
-    """Verifica mensagens no Telegram e processa comandos."""
+async def send_diagnostic(token, chat_id, diag: Dict, cfg: Config) -> bool:
+    matches_txt = "\n".join("  - %s" % m for m in diag["matches_list"][:15]) or "  Nenhuma partida"
+    near_txt = "\n".join("  %s" % m for m in diag["near_misses"][:10]) or "  Nenhum quase-favorito"
+    msg = (
+        "DIAGNOSTICO DO SCAN\n"
+        "-------------------\n"
+        "%s\n\n"
+        "Partidas verificadas: %d\n"
+        "Com odds: %d\n"
+        "Faixa alvo: %.2f - %.2f | Prob minima: %.0f%%\n"
+        "Entradas encontradas: %d\n\n"
+        "Jogos verificados:\n%s\n\n"
+        "Quase-favoritos (fora da faixa ou prob baixa):\n%s"
+    ) % (
+        datetime.now().strftime("%d/%m %H:%M"),
+        diag["matches_found"], diag["with_odds"],
+        cfg.odd_min, cfg.odd_max, cfg.min_prob * 100,
+        diag["entries_found"],
+        matches_txt, near_txt,
+    )
+    return await tg_send(token, chat_id, msg)
+
+
+async def send_startup(token, chat_id, cfg: Config) -> bool:
+    # Estimativa de uso da The Odds API (free tier = 500 req/mes)
+    # 2 chamadas (mercados + handicap) por liga ativa em cada scan
+    scans_por_dia = (24 * 60) / max(cfg.scan_interval_min, 1)
+    estimativa_mes = int(len(cfg.league_ids) * 2 * scans_por_dia * 30)
+    alerta_cota = (
+        "\nATENCAO: estimativa de %d chamadas/mes na Odds API (limite gratis: 500).\n"
+        "Aumente SCAN_INTERVAL_MIN ou reduza LEAGUE_IDS para nao estourar a cota."
+        % estimativa_mes
+    ) if estimativa_mes > 500 else "\nUso estimado na Odds API: %d chamadas/mes (dentro do limite gratis de 500)." % estimativa_mes
+
+    msg = (
+        "BETTING AI ENGINE - ONLINE\n"
+        "--------------------------\n\n"
+        "Estrategia: Favoritos de alta probabilidade\n"
+        "Mercados: 1X2, Over/Under (0.5 a 3.5), 1o Tempo, Ambas Marcam, Handicap Asiatico\n"
+        "Faixa de odd alvo: %.2f - %.2f\n"
+        "Probabilidade minima: %.0f%%\n"
+        "Banca: R$ %.2f\n"
+        "Max entradas por scan: %d\n"
+        "Scan a cada %d min\n"
+        "Ligas ativas: %d\n"
+        "%s\n\n"
+        "%s"
+    ) % (
+        cfg.odd_min, cfg.odd_max, cfg.min_prob * 100,
+        cfg.banca, cfg.max_entries, cfg.scan_interval_min,
+        len(cfg.league_ids), alerta_cota,
+        datetime.now().strftime("%d/%m/%Y %H:%M"),
+    )
+    return await tg_send(token, chat_id, msg)
+
+
+async def send_error(token, chat_id, error) -> bool:
+    return await tg_send(token, chat_id,
+        "ERRO\n<code>%s</code>\n%s" % (str(error)[:400], datetime.now().strftime("%d/%m %H:%M")))
+
+
+async def send_auto_results(token, chat_id, resolved: list) -> bool:
+    """Notifica resultados resolvidos automaticamente apos o jogo terminar."""
+    if not resolved:
+        return False
+    lines = []
+    for r in resolved:
+        tag = "GANHOU" if r["outcome"] == "win" else "PERDEU"
+        lines.append(
+            "%s - %s\n  %s | placar %s\n  stake R$ %.2f -> retorno R$ %.2f"
+            % (tag, r["match"], r["market"], r["score"], r["stake"], r["returned"])
+        )
+    banca_final = resolved[-1]["banca"]
+    msg = (
+        "RESULTADOS AUTOMATICOS\n"
+        "-----------------------\n\n"
+        + "\n\n".join(lines) +
+        "\n\nBanca atualizada: R$ %.2f" % banca_final
+    )
+    return await tg_send(token, chat_id, msg)
+
+
+async def send_backtest(token, chat_id, memory, days: int = 30) -> bool:
+    bt = memory.get_backtest(days)
+    if not bt:
+        return await tg_send(token, chat_id,
+            "BACKTEST (%d dias)\n-------------------\nSem resultados resolvidos ainda nesse periodo." % days)
+
+    o = bt["overall"]
+    by_league_txt = "\n".join(
+        "  %s: %dV %dD | ROI %+.1f%%" % (lg, s["wins"], s["losses"], s["roi"])
+        for lg, s in sorted(bt["by_league"].items(), key=lambda x: -(x[1]["wins"] + x[1]["losses"]))[:8]
+    ) or "  sem dados"
+    by_market_txt = "\n".join(
+        "  %s: %dV %dD | ROI %+.1f%%" % (mk, s["wins"], s["losses"], s["roi"])
+        for mk, s in sorted(bt["by_market"].items(), key=lambda x: -(x[1]["wins"] + x[1]["losses"]))[:8]
+    ) or "  sem dados"
+
+    msg = (
+        "BACKTEST - ULTIMOS %d DIAS\n"
+        "---------------------------\n\n"
+        "Total resolvidas: %d\n"
+        "Vitorias: %d | Derrotas: %d\n"
+        "Win rate: %.1f%%\n"
+        "Apostado: R$ %.2f | Retornado: R$ %.2f\n"
+        "ROI: %+.1f%%\n\n"
+        "POR LIGA:\n%s\n\n"
+        "POR MERCADO:\n%s"
+    ) % (
+        bt["days"], bt["total_rows"], o["wins"], o["losses"], o["win_rate"],
+        o["staked"], o["returned"], o["roi"], by_league_txt, by_market_txt,
+    )
+    return await tg_send(token, chat_id, msg)
+
+
+# ============================================================================
+# SCANNER PRINCIPAL
+# ============================================================================
+async def scan(cfg: Config, memory) -> Tuple[List[Dict], Dict]:
+    log.info("Scan iniciado - %d ligas configuradas" % len(cfg.league_ids))
+    diag = {"matches_found": 0, "with_odds": 0, "matches_list": [],
+            "near_misses": [], "entries_found": 0, "leagues_fallback": []}
+
+    loop = asyncio.get_event_loop()
+    matches_raw = await loop.run_in_executor(_executor, fetch_matches, cfg.football_data_key, cfg.league_ids, 2)
+
+    # Buscar odds de TODAS as ligas configuradas (sempre, mesmo sem fixture do football-data)
+    odds_by_league = {}
+    for lid in cfg.league_ids:
+        lid = lid.strip()
+        sport_key = SPORT_KEYS.get(lid)
+        if not sport_key:
+            continue
+        odds_list = await loop.run_in_executor(_executor, fetch_odds, cfg.odds_api_key, sport_key)
+        odds_by_league[lid] = odds_list
+
+    # football-data.org free so cobre ~12 ligas. Para as demais (Libertadores,
+    # MLS, Liga MX, Argentina, J-League etc.) usamos os proprios jogos
+    # retornados pela The Odds API como fonte de partidas (sem form/Elo,
+    # cai automaticamente para media da liga).
+    leagues_with_fd = set(m.get("league_id", "") for m in matches_raw)
+    all_matches = list(matches_raw)
+
+    for lid in cfg.league_ids:
+        lid = lid.strip()
+        if not lid or lid in leagues_with_fd:
+            continue
+        odds_list = odds_by_league.get(lid, [])
+        if not odds_list:
+            continue
+        diag["leagues_fallback"].append(lid)
+        for g in odds_list:
+            if not g.get("home") or not g.get("away"):
+                continue
+            all_matches.append({
+                "homeTeam": g["home"], "awayTeam": g["away"],
+                "league": LEAGUE_NAMES.get(lid, lid), "league_id": lid,
+                "date": _iso_to_brt(g.get("commence_time", "")),
+                "home_id": None, "away_id": None,
+            })
+
+    diag["matches_found"] = len(all_matches)
+    if not all_matches:
+        return [], diag
+
+    entries = []
+    for m in all_matches:
+        name = "%s vs %s" % (m["homeTeam"], m["awayTeam"])
+        diag["matches_list"].append(name)
+        lid = m.get("league_id", "")
+
+        odds_list = odds_by_league.get(lid, [])
+        odds = match_odds(m["homeTeam"], m["awayTeam"], odds_list)
+        if not odds or not any(v for v in odds.values() if v):
+            continue
+        diag["with_odds"] += 1
+
+        avg_s, avg_c = LEAGUE_AVGS.get(lid, (1.35, 1.05))
+        home_id, away_id = m.get("home_id"), m.get("away_id")
+
+        home_form = away_form = None
+        if cfg.football_data_key and home_id and away_id:
+            try:
+                home_form = await loop.run_in_executor(_executor, fetch_team_form, cfg.football_data_key, home_id, 6)
+                away_form = await loop.run_in_executor(_executor, fetch_team_form, cfg.football_data_key, away_id, 6)
+            except Exception as e:
+                log.warning("Erro form: %s" % e)
+
+        if home_form and home_form["sample"] >= 3 and away_form and away_form["sample"] >= 3:
+            home_attack  = (home_form["home_scored"] or home_form["scored"]) * (0.85 + 0.30 * home_form["form_score"])
+            home_defense = (home_form["home_conceded"] or home_form["conceded"]) * (1.15 - 0.30 * home_form["form_score"])
+            away_attack  = (away_form["away_scored"] or away_form["scored"]) * (0.85 + 0.30 * away_form["form_score"])
+            away_defense = (away_form["away_conceded"] or away_form["conceded"]) * (1.15 - 0.30 * away_form["form_score"])
+            data_source = "real"
+        else:
+            home_attack, home_defense = avg_s * 1.10, avg_c * 0.90
+            away_attack, away_defense = avg_s * 0.90, avg_c * 1.10
+            data_source = "liga"
+
+        # Ajuste por Elo Rating — time mais forte ataca mais e defende melhor
+        elo_home = memory.elo_strength_factor(home_id, m["homeTeam"]) if home_id else 1.0
+        elo_away = memory.elo_strength_factor(away_id, m["awayTeam"]) if away_id else 1.0
+        home_attack  *= elo_home
+        home_defense /= elo_home
+        away_attack  *= elo_away
+        away_defense /= elo_away
+
+        favorites = find_favorite_markets(home_attack, home_defense, away_attack, away_defense, odds, cfg)
+
+        if favorites:
+            best = favorites[0]
+            entries.append({
+                "home_team": m["homeTeam"], "away_team": m["awayTeam"],
+                "league": m["league"], "league_id": lid, "date": m["date"],
+                "data_source": data_source,
+                "market_key": best["key"], "market_label": best["label"],
+                "odds": best["odds"], "prob": best["prob"], "implied": best["implied"],
+                "ev_pct": best["ev_pct"], "edge_pct": best["edge_pct"],
+                "stake": best["stake"],
+            })
+            diag["entries_found"] += 1
+            log.info("  FAVORITO: %s - %s @ %.2f (prob %.1f%%)" % (
+                name, best["label"], best["odds"], best["prob"] * 100))
+        else:
+            # Registrar o mercado mais proximo do alvo para diagnostico
+            lh = home_attack * away_defense
+            la = away_attack * home_defense
+            probs = match_probs(lh, la)
+            closest = None
+            closest_dist = 999
+            for key, prob in probs.items():
+                o = odds.get(key)
+                if not o or o <= 1.01:
+                    continue
+                d = abs(o - 1.50)
+                if d < closest_dist:
+                    closest_dist, closest = d, (key, prob, o)
+            if closest:
+                k, p, o = closest
+                diag["near_misses"].append(
+                    "%s: %s @ %.2f (prob %.1f%%)" % (name, MARKET_LABELS.get(k, k), o, p * 100)
+                )
+
+    entries.sort(key=lambda x: -x["prob"])
+    entries = entries[:cfg.max_entries]
+
+    log.info("Scan finalizado: %d favoritos de %d partidas (%d com odds, %d ligas via fallback Odds API)" % (
+        len(entries), diag["matches_found"], diag["with_odds"], len(diag["leagues_fallback"])))
+    return entries, diag
+
+
+# ============================================================================
+# MEMORIA — banca e historico
+# ============================================================================
+
+# ============================================================================
+# ELO RATING — forca relativa de cada time, atualizado a cada resultado
+# ============================================================================
+ELO_BASE = 1500.0
+ELO_K = 24.0           # velocidade de ajuste por jogo
+ELO_HOME_ADV = 60.0    # bonus de mando de campo em pontos Elo
+
+
+def elo_expected(rating_a: float, rating_b: float) -> float:
+    """Probabilidade esperada de A vencer B dado os ratings (formula classica do Elo)."""
+    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400.0))
+
+
+def elo_update(rating_a: float, rating_b: float, score_a: float, k: float = ELO_K) -> float:
+    """
+    score_a: 1.0 = A venceu, 0.5 = empate, 0.0 = A perdeu
+    Retorna o novo rating de A.
+    """
+    expected = elo_expected(rating_a, rating_b)
+    return rating_a + k * (score_a - expected)
+
+
+def elo_goal_multiplier(goal_diff: int) -> float:
+    """Vitorias por margem maior pesam mais no ajuste do Elo (padrao usado no futebol)."""
+    gd = abs(goal_diff)
+    if gd <= 1: return 1.0
+    if gd == 2: return 1.5
+    return 1.5 + (gd - 2) / 8.0
+
+
+# ============================================================================
+# RESULTADOS FINALIZADOS — alimenta Elo e resolve apostas automaticamente
+# ============================================================================
+def fetch_finished_matches(api_key: str, league_ids: List[str], days_back: int = 3) -> List[Dict]:
+    today = date.today()
+    start = today - timedelta(days=days_back)
+    headers = {"X-Auth-Token": api_key}
+    finished = []
+    for lid in league_ids:
+        lid = lid.strip()
+        if not lid:
+            continue
+        url = (
+            "https://api.football-data.org/v4/competitions/%s/matches"
+            "?dateFrom=%s&dateTo=%s&status=FINISHED"
+        ) % (lid, start.isoformat(), today.isoformat())
+        data = http_get(url, headers)
+        if not data:
+            continue
+        for m in data.get("matches", []):
+            score = m.get("score", {}).get("fullTime", {})
+            hg, ag = score.get("home"), score.get("away")
+            if hg is None or ag is None:
+                continue
+            finished.append({
+                "league_id": lid,
+                "home_id": m.get("homeTeam", {}).get("id"),
+                "home_name": m.get("homeTeam", {}).get("shortName") or m.get("homeTeam", {}).get("name", "?"),
+                "away_id": m.get("awayTeam", {}).get("id"),
+                "away_name": m.get("awayTeam", {}).get("shortName") or m.get("awayTeam", {}).get("name", "?"),
+                "home_goals": hg, "away_goals": ag,
+            })
+    return finished
+
+
+def evaluate_market_outcome(market_key: str, hg: int, ag: int) -> Optional[bool]:
+    """Retorna True (ganhou), False (perdeu) ou None (mercado nao reconhecido)."""
+    if market_key == "home":        return hg > ag
+    if market_key == "draw":        return hg == ag
+    if market_key == "away":        return ag > hg
+    if market_key == "over25":      return (hg + ag) > 2.5
+    if market_key == "under25":     return (hg + ag) < 2.5
+    if market_key == "btts":        return hg > 0 and ag > 0
+    if market_key == "ah_home_m5":  return hg > ag
+    if market_key == "ah_home_p5":  return hg >= ag
+    if market_key == "ah_away_m5":  return ag > hg
+    if market_key == "ah_away_p5":  return ag >= hg
+    return None
+
+
+# ============================================================================
+# BANCO SQLITE — historico estruturado de previsoes, odds e resultados
+# ============================================================================
+import sqlite3
+
+
+class Database:
+    def __init__(self, path="data/betting.db"):
+        self.path = path
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._migrate()
+
+    def _migrate(self):
+        c = self.conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_key TEXT NOT NULL,
+                home_team TEXT, away_team TEXT, league TEXT, league_id TEXT,
+                market_key TEXT, market_label TEXT,
+                odds_at_alert REAL, odds_now REAL,
+                prob_real REAL, implied REAL, ev_pct REAL,
+                stake REAL, date_sent TEXT,
+                outcome TEXT, returned REAL DEFAULT 0,
+                data_source TEXT
+            )
+        """)
+        # Migracao leve: adiciona league_id se o banco for de uma versao anterior
+        try:
+            c.execute("ALTER TABLE tips ADD COLUMN league_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # coluna ja existe
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS elo (
+                team_id INTEGER PRIMARY KEY,
+                team_name TEXT,
+                rating REAL DEFAULT 1500.0,
+                games INTEGER DEFAULT 0,
+                updated_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS config_kv (
+                k TEXT PRIMARY KEY, v TEXT
+            )
+        """)
+        self.conn.commit()
+
+        old_json = "data/history.json"
+        c.execute("SELECT COUNT(*) AS n FROM tips")
+        n_tips = c.fetchone()["n"]
+        if n_tips == 0 and os.path.exists(old_json):
+            try:
+                old = json.load(open(old_json, "r", encoding="utf-8"))
+                for t in old.get("tips", []):
+                    c.execute(
+                        "INSERT INTO tips (match_key, home_team, away_team, league, market_key, "
+                        "odds_at_alert, stake, date_sent, outcome, returned) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (t.get("match",""), t.get("home_team",""), t.get("away_team",""),
+                         t.get("league",""), t.get("market",""), t.get("odds",0),
+                         t.get("stake",0), t.get("date",""), t.get("outcome"), t.get("returned",0) or 0)
+                    )
+                if old.get("banca") is not None:
+                    self.set_kv("banca", str(old["banca"]))
+                self.conn.commit()
+                log.info("Migrado %d tips do JSON antigo para SQLite" % len(old.get("tips",[])))
+            except Exception as e:
+                log.warning("Falha ao migrar JSON antigo: %s" % e)
+
+    def get_kv(self, key, default=None):
+        c = self.conn.cursor()
+        c.execute("SELECT v FROM config_kv WHERE k=?", (key,))
+        row = c.fetchone()
+        return row["v"] if row else default
+
+    def set_kv(self, key, value):
+        c = self.conn.cursor()
+        c.execute("INSERT INTO config_kv (k,v) VALUES (?,?) "
+                   "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, str(value)))
+        self.conn.commit()
+
+    def already_sent_today(self, match_key) -> bool:
+        today = date.today().isoformat()
+        c = self.conn.cursor()
+        c.execute("SELECT 1 FROM tips WHERE match_key=? AND date_sent=?", (match_key, today))
+        return c.fetchone() is not None
+
+    def record(self, match_key, entry):
+        c = self.conn.cursor()
+        c.execute(
+            "INSERT INTO tips (match_key, home_team, away_team, league, league_id, market_key, market_label, "
+            "odds_at_alert, odds_now, prob_real, implied, ev_pct, stake, date_sent, outcome, data_source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (match_key, entry.get("home_team",""), entry.get("away_team",""), entry.get("league",""),
+             entry.get("league_id",""),
+             entry.get("market_key",""), entry.get("market_label",""),
+             entry.get("odds",0), entry.get("odds",0),
+             entry.get("prob",0), entry.get("implied",0), entry.get("ev_pct",0),
+             entry.get("stake",0), date.today().isoformat(), None, entry.get("data_source",""))
+        )
+        self.conn.commit()
+
+    def update_odds_now(self, match_key, odds_now):
+        c = self.conn.cursor()
+        c.execute("UPDATE tips SET odds_now=? WHERE match_key=? AND outcome IS NULL", (odds_now, match_key))
+        self.conn.commit()
+
+    def get_pending(self, days_back=3):
+        cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM tips WHERE outcome IS NULL AND date_sent>=?", (cutoff,))
+        return [dict(r) for r in c.fetchall()]
+
+    def set_outcome(self, tip_id, outcome, returned):
+        c = self.conn.cursor()
+        c.execute("UPDATE tips SET outcome=?, returned=? WHERE id=?", (outcome, returned, tip_id))
+        self.conn.commit()
+
+    def get_banca(self, cfg_banca):
+        v = self.get_kv("banca")
+        return float(v) if v is not None else cfg_banca
+
+    def set_banca(self, valor):
+        self.set_kv("banca", round(float(valor), 2))
+
+    def registrar_resultado(self, ganhou, valor):
+        banca = self.get_banca(0)
+        nova = round(banca + valor, 2) if ganhou else round(max(0, banca - valor), 2)
+        self.set_banca(nova)
+        return nova
+
+    def get_stats(self):
+        c = self.conn.cursor()
+        c.execute("SELECT COUNT(*) AS n FROM tips")
+        sent = c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(stake),0) AS staked FROM tips WHERE outcome='loss'")
+        row = c.fetchone(); losses, staked = row["n"], row["staked"]
+        c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(returned),0) AS returned FROM tips WHERE outcome='win'")
+        row = c.fetchone(); wins, returned = row["n"], row["returned"]
+        total = wins + losses
+        wr = (wins/total*100) if total > 0 else 0
+        roi = ((returned-staked)/staked*100) if staked > 0 else 0
+        return {
+            "banca": self.get_banca(0), "enviados": sent,
+            "wins": wins, "losses": losses, "total": total,
+            "win_rate": round(wr,1), "roi": round(roi,1),
+            "staked": round(staked,2), "returned": round(returned,2),
+        }
+
+    def get_backtest(self, days=30):
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT league, market_label, odds_at_alert, outcome, stake, returned "
+            "FROM tips WHERE date_sent>=? AND outcome IS NOT NULL", (cutoff,)
+        )
+        rows = [dict(r) for r in c.fetchall()]
+        if not rows:
+            return None
+
+        def summarize(rows_subset):
+            w = sum(1 for r in rows_subset if r["outcome"] == "win")
+            l = sum(1 for r in rows_subset if r["outcome"] == "loss")
+            staked = sum(r["stake"] for r in rows_subset if r["outcome"] in ("win","loss"))
+            returned = sum(r["returned"] for r in rows_subset if r["outcome"] == "win")
+            roi = ((returned-staked)/staked*100) if staked > 0 else 0
+            wr = (w/(w+l)*100) if (w+l) > 0 else 0
+            return {"wins": w, "losses": l, "win_rate": round(wr,1), "roi": round(roi,1),
+                    "staked": round(staked,2), "returned": round(returned,2)}
+
+        by_league = {}
+        for r in rows: by_league.setdefault(r["league"], []).append(r)
+        by_market = {}
+        for r in rows: by_market.setdefault(r["market_label"], []).append(r)
+
+        return {
+            "overall": summarize(rows),
+            "by_league": {k: summarize(v) for k, v in by_league.items()},
+            "by_market": {k: summarize(v) for k, v in by_market.items()},
+            "days": days, "total_rows": len(rows),
+        }
+
+    def get_elo(self, team_id, team_name=""):
+        c = self.conn.cursor()
+        c.execute("SELECT rating, games FROM elo WHERE team_id=?", (team_id,))
+        row = c.fetchone()
+        if row:
+            return row["rating"], row["games"]
+        c.execute("INSERT INTO elo (team_id, team_name, rating, games, updated_at) VALUES (?,?,?,?,?)",
+                   (team_id, team_name, ELO_BASE, 0, datetime.now().isoformat()))
+        self.conn.commit()
+        return ELO_BASE, 0
+
+    def update_elo_match(self, home_id, home_name, away_id, away_name, home_goals, away_goals):
+        if home_id is None or away_id is None:
+            return
+        rh, gh = self.get_elo(home_id, home_name)
+        ra, ga = self.get_elo(away_id, away_name)
+
+        if home_goals > away_goals:   score_h = 1.0
+        elif home_goals == away_goals: score_h = 0.5
+        else:                          score_h = 0.0
+
+        mult = elo_goal_multiplier(home_goals - away_goals)
+        new_rh = elo_update(rh + ELO_HOME_ADV, ra, score_h, ELO_K * mult) - ELO_HOME_ADV
+        new_ra = elo_update(ra, rh + ELO_HOME_ADV, 1.0 - score_h, ELO_K * mult)
+
+        c = self.conn.cursor()
+        c.execute("UPDATE elo SET rating=?, games=games+1, updated_at=? WHERE team_id=?",
+                   (round(new_rh,1), datetime.now().isoformat(), home_id))
+        c.execute("UPDATE elo SET rating=?, games=games+1, updated_at=? WHERE team_id=?",
+                   (round(new_ra,1), datetime.now().isoformat(), away_id))
+        self.conn.commit()
+
+    def elo_strength_factor(self, team_id, team_name=""):
+        rating, games = self.get_elo(team_id, team_name)
+        if games < 5:
+            return 1.0
+        diff = rating - ELO_BASE
+        factor = 1.0 + (diff / 400.0) * 0.30
+        return max(0.70, min(1.35, factor))
+
+    def process_finished_results(self, finished_matches: list) -> dict:
+        """
+        Para cada jogo finalizado:
+          1. Atualiza o Elo dos dois times.
+          2. Procura apostas pendentes (tips) que batem com esse jogo
+             pelo nome dos times e resolve automaticamente (win/loss).
+          3. Atualiza a banca com o resultado.
+        Retorna um resumo do que foi processado.
+        """
+        resolved = []
+        elo_updates = 0
+
+        pending = self.get_pending(days_back=5)
+
+        for fm in finished_matches:
+            # 1. Elo
+            self.update_elo_match(fm["home_id"], fm["home_name"],
+                                   fm["away_id"], fm["away_name"],
+                                   fm["home_goals"], fm["away_goals"])
+            elo_updates += 1
+
+            # 2. Resolver tips pendentes que correspondem a esse jogo
+            for tip in pending:
+                if tip.get("outcome") is not None:
+                    continue
+                sh = names_match(tip["home_team"], fm["home_name"])
+                sa = names_match(tip["away_team"], fm["away_name"])
+                if sh < 3 or sa < 3:
+                    continue
+                won = evaluate_market_outcome(tip["market_key"], fm["home_goals"], fm["away_goals"])
+                if won is None:
+                    continue
+                returned = round(tip["stake"] * tip["odds_at_alert"], 2) if won else 0.0
+                outcome = "win" if won else "loss"
+                self.set_outcome(tip["id"], outcome, returned)
+
+                # 3. Atualizar banca
+                banca = self.get_banca(0)
+                if won:
+                    nova = round(banca + returned - tip["stake"], 2)
+                else:
+                    nova = round(max(0, banca - tip["stake"]), 2)
+                self.set_banca(nova)
+
+                resolved.append({
+                    "match": "%s vs %s" % (tip["home_team"], tip["away_team"]),
+                    "market": tip["market_label"], "outcome": outcome,
+                    "score": "%d-%d" % (fm["home_goals"], fm["away_goals"]),
+                    "stake": tip["stake"], "returned": returned, "banca": nova,
+                })
+                tip["outcome"] = outcome  # evita resolver de novo no mesmo loop
+
+        return {"resolved": resolved, "elo_updates": elo_updates}
+
+
+class Memory:
+    """Wrapper fino sobre Database (SQLite) — mantem a mesma interface de antes."""
+    def __init__(self, path="data/betting.db"):
+        self.db = Database(path)
+
+    def get_banca(self, cfg_banca): return self.db.get_banca(cfg_banca)
+    def set_banca(self, valor): self.db.set_banca(valor)
+    def registrar_resultado(self, ganhou, valor): return self.db.registrar_resultado(ganhou, valor)
+    def already_sent_today(self, key): return self.db.already_sent_today(key)
+    def record(self, key, entry): self.db.record(key, entry)
+    def get_stats(self): return self.db.get_stats()
+    def get_backtest(self, days=30): return self.db.get_backtest(days)
+    def get_pending(self, days_back=3): return self.db.get_pending(days_back)
+    def set_outcome(self, tip_id, outcome, returned): self.db.set_outcome(tip_id, outcome, returned)
+    def update_odds_now(self, key, odds_now): self.db.update_odds_now(key, odds_now)
+    def elo_strength_factor(self, team_id, team_name=""): return self.db.elo_strength_factor(team_id, team_name)
+    def update_elo_match(self, *a, **kw): return self.db.update_elo_match(*a, **kw)
+    def process_finished_results(self, finished_matches): return self.db.process_finished_results(finished_matches)
+
+
+# ============================================================================
+# COMANDOS TELEGRAM
+# ============================================================================
+async def process_commands(cfg: Config, memory: Memory):
     loop = asyncio.get_event_loop()
     offset_file = "data/tg_offset.json"
     offset = 0
@@ -1456,264 +1359,169 @@ async def process_commands(cfg, memory):
 
     for upd in updates:
         offset = upd["update_id"] + 1
-        msg    = upd.get("message", {})
-        text   = msg.get("text", "").strip()
-        chat   = str(msg.get("chat", {}).get("id", ""))
+        msg = upd.get("message", {})
+        text = msg.get("text", "").strip()
+        chat = str(msg.get("chat", {}).get("id", ""))
 
-        # Aceitar apenas do chat configurado
         if chat != cfg.telegram_chat_id:
             continue
 
         parts = text.split()
-        cmd   = parts[0].lower() if parts else ""
+        cmd = parts[0].lower() if parts else ""
 
         if cmd == "/banca":
             if len(parts) < 2:
-                await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                    "Uso: /banca 150.00\nExemplo: /banca 47.50")
+                await tg_send(cfg.telegram_token, cfg.telegram_chat_id, "Uso: /banca 150.00")
                 continue
             try:
                 valor = float(parts[1].replace(",", "."))
                 memory.set_banca(valor)
                 cfg.banca = valor
-                mode = get_banca_mode(valor)
                 await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                    "✅ <b>Banca atualizada!</b>\n"
-                    "💰 Nova banca: <b>R$ %.2f</b>\n"
-                    "%s Modo ativo: <b>%s</b>\n"
-                    "🎯 %s" % (valor, mode["emoji"], mode["nome"], mode["objetivo"]))
+                    "Banca atualizada: R$ %.2f" % valor)
             except ValueError:
-                await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                    "Valor invalido. Use: /banca 150.00")
+                await tg_send(cfg.telegram_token, cfg.telegram_chat_id, "Valor invalido.")
 
         elif cmd == "/ganhou":
             if len(parts) < 2:
-                await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                    "Uso: /ganhou 47.20\n(informe o LUCRO obtido)")
+                await tg_send(cfg.telegram_token, cfg.telegram_chat_id, "Uso: /ganhou 47.20 (lucro)")
                 continue
             try:
                 lucro = float(parts[1].replace(",", "."))
-                nova  = memory.registrar_resultado(True, lucro)
+                nova = memory.registrar_resultado(True, lucro)
                 cfg.banca = nova
-                mode  = get_banca_mode(nova)
                 await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                    "✅ <b>Vitoria registrada!</b>\n"
-                    "💵 Lucro: +R$ %.2f\n"
-                    "💰 Banca atual: <b>R$ %.2f</b>\n"
-                    "%s Modo: <b>%s</b>" % (lucro, nova, mode["emoji"], mode["nome"]))
+                    "Vitoria! +R$ %.2f | Banca: R$ %.2f" % (lucro, nova))
             except ValueError:
                 await tg_send(cfg.telegram_token, cfg.telegram_chat_id, "Valor invalido.")
 
         elif cmd == "/perdeu":
             if len(parts) < 2:
-                await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                    "Uso: /perdeu 13.08\n(informe o valor que apostou)")
+                await tg_send(cfg.telegram_token, cfg.telegram_chat_id, "Uso: /perdeu 13.08 (valor apostado)")
                 continue
             try:
                 perda = float(parts[1].replace(",", "."))
-                nova  = memory.registrar_resultado(False, perda)
+                nova = memory.registrar_resultado(False, perda)
                 cfg.banca = nova
-                mode  = get_banca_mode(nova)
                 await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                    "❌ <b>Derrota registrada.</b>\n"
-                    "💸 Perda: -R$ %.2f\n"
-                    "💰 Banca atual: <b>R$ %.2f</b>\n"
-                    "%s Modo: <b>%s</b>" % (perda, nova, mode["emoji"], mode["nome"]))
+                    "Derrota. -R$ %.2f | Banca: R$ %.2f" % (perda, nova))
             except ValueError:
                 await tg_send(cfg.telegram_token, cfg.telegram_chat_id, "Valor invalido.")
 
         elif cmd == "/status":
-            stats = memory.get_stats()
-            mode  = get_banca_mode(stats["banca"])
-            today_tips = [t for t in memory.data["tips"] if t["date"] == date.today().isoformat()]
-            today_str  = "\n".join(
-                "  • %s vs %s — %s @ %.2f" % (
-                    t["match"].split("-")[0], t["match"].split("-")[1],
-                    t.get("market",""), t.get("odds",0))
-                for t in today_tips[-5:]
-            ) or "  Nenhum sinal hoje ainda"
+            s = memory.get_stats()
             await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                "📊 <b>STATUS DO SISTEMA</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "%s Modo: <b>%s</b>\n"
-                "💰 Banca: <b>R$ %.2f</b>\n"
-                "🎯 Objetivo: %s\n\n"
-                "<b>Historico:</b>\n"
-                "📤 Sinais enviados: %d\n"
-                "✅ Vitorias: %d\n"
-                "❌ Derrotas: %d\n"
-                "🎯 Win rate: %.1f%%\n"
-                "📈 ROI: %+.1f%%\n\n"
-                "<b>Sinais de hoje:</b>\n%s\n\n"
-                "<i>Use /banca 150 para atualizar\n"
-                "/ganhou 47.20 para registrar vitoria\n"
-                "/perdeu 13.08 para registrar derrota</i>" % (
-                mode["emoji"], mode["nome"],
-                stats["banca"], mode["objetivo"],
-                stats["enviados"], stats["wins"], stats["losses"],
-                stats["win_rate"], stats["roi"],
-                today_str))
+                "STATUS\n------\n"
+                "Banca: R$ %.2f\n"
+                "Sinais enviados: %d\n"
+                "Vitorias: %d | Derrotas: %d\n"
+                "Win rate: %.1f%%\n"
+                "ROI: %+.1f%%" % (
+                    s["banca"], s["enviados"], s["wins"], s["losses"], s["win_rate"], s["roi"]))
 
-        elif cmd == "/silencio":
-            horas = int(parts[1]) if len(parts) > 1 else 8
-            until = memory.set_silent(horas)
-            await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                "🔇 <b>Modo silencioso ativado por %d horas.</b>\n"
-                "Scans continuam mas alertas pausados ate %s.\n"
-                "Use /ativar para reativar." % (horas, until[:16]))
-
-        elif cmd == "/ativar":
-            memory.clear_silent()
-            await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                "🔊 <b>Alertas reativados!</b> Sistema voltou ao normal.")
-
-        elif cmd == "/relatorio":
-            await send_weekly_report(cfg.telegram_token, cfg.telegram_chat_id, memory, cfg.gemini_api_key)
-
-        elif cmd == "/ligas":
-            ligas_txt = "\n".join("  %s — %s" % (k,v) for k,v in sorted(LEAGUE_NAMES.items()))
-            await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                "⚽ <b>LIGAS SUPORTADAS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n%s\n\n"
-                "Para ativar, va em Railway → Variables → LEAGUE_IDS\n"
-                "Exemplo: PL,PD,BSA,CLI,CSA" % ligas_txt)
+        elif cmd == "/backtest":
+            dias = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
+            await send_backtest(cfg.telegram_token, cfg.telegram_chat_id, memory, dias)
 
         elif cmd == "/ajuda":
             await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-                "🤖 <b>COMANDOS DISPONIVEIS</b>\n\n"
-                "/banca 150.00 — atualiza a banca\n"
-                "/ganhou 47.20 — registra vitoria (lucro)\n"
-                "/perdeu 13.08 — registra derrota (valor apostado)\n"
-                "/status — banca, modo e historico\n"
-                "/silencio 8 — silenciar por 8 horas\n"
-                "/ativar — reativar alertas\n"
-                "/relatorio — relatorio semanal\n"
-                "/ligas — ligas disponiveis\n"
-                "/ajuda — esta mensagem")
+                "COMANDOS\n--------\n"
+                "/banca 150.00 - atualiza banca\n"
+                "/ganhou 47.20 - registra vitoria\n"
+                "/perdeu 13.08 - registra derrota\n"
+                "/status - ver banca e historico\n"
+                "/backtest 30 - relatorio por liga e mercado\n"
+                "/ajuda - esta mensagem\n\n"
+                "Resultados tambem sao resolvidos automaticamente\n"
+                "apos o fim de cada jogo, sem precisar digitar nada.")
 
-    # Salvar offset
     try:
         json.dump({"offset": offset}, open(offset_file, "w"))
     except Exception:
         pass
 
 
+# ============================================================================
+# LOOP PRINCIPAL
+# ============================================================================
 async def run_cycle(cfg: Config, memory: Memory):
     log.info("=" * 50)
-    log.info("Ciclo — %s" % datetime.now().strftime("%d/%m/%Y %H:%M"))
+    log.info("Ciclo - %s" % datetime.now().strftime("%d/%m/%Y %H:%M"))
     try:
         cfg.banca = memory.get_banca(cfg.banca)
-        mode = get_banca_mode(cfg.banca)
-        log.info("Modo: %s (R$ %.2f)" % (mode["nome"], cfg.banca))
 
-        # Modo silencioso ativo — pular alertas mas continuar scans
-        if memory.is_silent():
-            log.info("Modo silencioso ativo — pulando alertas")
-            return
+        # 1. Processar jogos finalizados: atualiza Elo + resolve apostas pendentes
+        try:
+            finished = await asyncio.get_event_loop().run_in_executor(
+                _executor, fetch_finished_matches, cfg.football_data_key, cfg.league_ids, 3
+            )
+            if finished:
+                result = memory.process_finished_results(finished)
+                if result["elo_updates"]:
+                    log.info("Elo atualizado com %d jogos finalizados" % result["elo_updates"])
+                if result["resolved"]:
+                    cfg.banca = memory.get_banca(cfg.banca)
+                    await send_auto_results(cfg.telegram_token, cfg.telegram_chat_id, result["resolved"])
+        except Exception as e:
+            log.warning("Erro ao processar resultados finalizados: %s" % e)
 
-        # Relatorio semanal (domingo)
-        if memory.needs_weekly_report():
-            await send_weekly_report(cfg.telegram_token, cfg.telegram_chat_id, memory, cfg.gemini_api_key)
-            wr_key = "weekly-report-%s" % date.today().isoformat()
-            memory.record(wr_key, {"market_key":"weekly","league":"system","odds":1.0,"stake":0,"ev_pct":0})
-
-        opps, diag = await scan(cfg)
-        min_ev = memory.get_adaptive_min_ev(cfg.min_ev_pct)
+        # 2. Scan normal de favoritos
+        entries, diag = await scan(cfg, memory)
 
         if cfg.debug_mode:
-            await send_diagnostic(cfg.telegram_token, cfg.telegram_chat_id, diag, min_ev)
+            await send_diagnostic(cfg.telegram_token, cfg.telegram_chat_id, diag, cfg)
 
-        if not opps:
-            log.info("Sem oportunidades EV+ apos filtros de sanidade")
+        if not entries:
+            log.info("Nenhum favorito encontrado nesse scan")
             return
 
-        mode_filtered = filter_by_mode(opps, mode, cfg.banca)
-        filtered      = [o for o in mode_filtered if o["ev_pct"] >= min_ev]
-        log.info("%d oportunidades passaram todos os filtros" % len(filtered))
-
-        if not filtered:
-            log.info("Nenhuma oportunidade valida hoje (modo %s, EV min %.1f%%)" % (mode["nome"], min_ev))
-            # Avisar o usuario por que nao ha entradas
-            msg_no_filter = ("🔍 Scan %s — %d jogos EV+ encontrados, nenhum passou os filtros do modo %s. "
-                             "Criterios: prob >= %.0f%%, odds %.1f-5.0, EV >= %.1f%%. Monitorando." % (
-                             datetime.now().strftime("%d/%m %H:%M"),
-                             len(opps), mode["nome"], mode["min_prob"]*100, mode["min_odds"], min_ev))
-            await tg_send(cfg.telegram_token, cfg.telegram_chat_id, msg_no_filter)
-            return
-
-        # Enviar alertas individuais
         sent = 0
-        max_ind = mode["max_apostas"]
-        for opp in filtered[:max_ind]:
-            key = "%s-%s-%s" % (opp["home_team"], opp["away_team"], opp["market_key"])
+        for entry in entries:
+            key = "%s-%s-%s" % (entry["home_team"], entry["away_team"], entry["market_key"])
             if memory.already_sent_today(key):
-                log.info("Ja enviado hoje: %s" % key)
                 continue
-            ok = await send_opportunity(cfg.telegram_token, cfg.telegram_chat_id, opp)
+            ok = await send_entry(cfg.telegram_token, cfg.telegram_chat_id, entry, cfg)
             if ok:
-                await asyncio.sleep(1)
-                if opp.get("ai_analysis"):
-                    await send_analysis(cfg.telegram_token, cfg.telegram_chat_id, opp)
-                memory.record(key, opp)
+                memory.record(key, entry)
                 sent += 1
                 await asyncio.sleep(2)
-        log.info("%d alertas individuais enviados" % sent)
-
-        # Estrategia do dia (1x por dia)
-        strategy_key = "strategy-%s" % date.today().isoformat()
-        if not memory.already_sent_today(strategy_key):
-            log.info("Montando estrategia do dia (modo %s)..." % mode["nome"])
-            strat = assess_day(filtered, cfg.banca, min_ev)
-            await asyncio.sleep(3)
-            await send_strategy(cfg.telegram_token, cfg.telegram_chat_id,
-                                strat, cfg.banca, cfg.gemini_api_key)
-            memory.record(strategy_key, {
-                "market_key":"strategy","league":"system","odds":1.0,"stake":0,"ev_pct":0,
-                "home_team":"","away_team":""
-            })
-            log.info("Estrategia enviada: %s" % strat["rec"])
+        log.info("%d entradas enviadas" % sent)
 
     except Exception as e:
         log.error("Erro no ciclo: %s" % e, exc_info=True)
-        try: await send_error(cfg.telegram_token, cfg.telegram_chat_id, str(e))
-        except Exception: pass
+        try:
+            await send_error(cfg.telegram_token, cfg.telegram_chat_id, str(e))
+        except Exception:
+            pass
 
 
 async def main():
     log.info("=" * 60)
-    log.info("Iniciando Betting AI Engine")
+    log.info("Iniciando Betting AI Engine - Favoritos")
     log.info("=" * 60)
+
     cfg = Config()
     try:
         cfg.validate()
     except ValueError as e:
-        log.error(str(e)); sys.exit(1)
+        log.error(str(e))
+        sys.exit(1)
 
     memory = Memory()
-    # Carregar banca da memoria se disponivel
     cfg.banca = memory.get_banca(cfg.banca)
-    mode = get_banca_mode(cfg.banca)
-    log.info("Banca: R$ %.2f | Modo: %s | EV min: %.1f%% | Scan: %dmin" % (
-        cfg.banca, mode["nome"], cfg.min_ev_pct, cfg.scan_interval_min))
+    log.info("Banca: R$ %.2f | Odd alvo: %.2f-%.2f | Prob min: %.0f%%" % (
+        cfg.banca, cfg.odd_min, cfg.odd_max, cfg.min_prob * 100))
 
     ok = await send_startup(cfg.telegram_token, cfg.telegram_chat_id, cfg)
     log.info("Telegram OK" if ok else "Telegram falhou")
-    await tg_send(cfg.telegram_token, cfg.telegram_chat_id,
-        "💡 <b>Comandos disponiveis:</b>\n"
-        "/banca 150 — atualizar banca\n"
-        "/ganhou 47.20 — registrar vitoria\n"
-        "/perdeu 13.08 — registrar derrota\n"
-        "/status — ver banca e historico\n"
-        "/ajuda — todos os comandos")
 
     cycle = 0
     while True:
         cycle += 1
         log.info("--- Ciclo #%d ---" % cycle)
-        # Verificar comandos antes de cada ciclo
         await process_commands(cfg, memory)
         await run_cycle(cfg, memory)
         log.info("Aguardando %d minutos..." % cfg.scan_interval_min)
-        # Verificar comandos periodicamente enquanto espera
         for _ in range(cfg.scan_interval_min):
             await asyncio.sleep(60)
             await process_commands(cfg, memory)
